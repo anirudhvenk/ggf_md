@@ -1,1126 +1,595 @@
-from dataclasses import dataclass
-from scoremd.data.dataset.base import Datapoints
-from scoremd.data.dataset.minipeptide import CGMinipeptideDataset, PeptideDatapoints
-from functools import partial
-import logging
-import math
-import os
-from typing import Any, Callable, Optional, Sequence
-import jax
-import jax.numpy as jnp
-import matplotlib.pyplot as plt
-from scipy.stats import gaussian_kde
-from tqdm import tqdm, trange
-from scoremd.data.dataset.protein import SingleProteinDataset
-import scoremd.diffusion.classic.sde as sdes
-from scoremd.diffusion.classic.utils import perturb
-from scoremd.diffusion.fp import fp_vp_error
-import wandb as wandb_lib
-from scoremd.data.dataset import ToyDataset, ToyDatasets, Dataset, ALDPDataset, MuellerBrownSimulation
-from scoremd.models.mixture import MixtureOfModels
-from scoremd.rmsd import kabsch_align_many
-from scoremd.simulation import create_langevin_step_function, simulate
-from scoremd.utils.evaluation import helper_metrics_2d, js_divergence
-from scoremd.utils.plots import plot_force_2d, plot_potential_2d, save_parts_of_figure
-from flax.core import FrozenDict
-import numpy as onp
-import scoremd.evaluate.molecules as molecules
+"""Independent generation, resumable Langevin simulation, and dipeptide metrics."""
+
+import argparse
+import hashlib
 import json
-import gc
+import math
+import time
+from pathlib import Path
 
-log = logging.getLogger(__name__)
-DPI = 200
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import gaussian_kde
+
+from model import DipeptideModel
+from train import load_config, load_split
+
+METHODS = ("diffusion", "two_for_one", "mixture", "fokker_planck")
+# Table of complete dipeptide metrics, arXiv:2506.17139v3, section C.8.1.
+PAPER = {
+    "diffusion": ([.0155, .2256, .206, 6.515], [.0083, .1304, .159, 3.175]),
+    "two_for_one": ([.0153, .0466, .203, .741], [.0080, .0114, .149, .319]),
+    "mixture": ([.0155, .0444, .200, .658], [.0078, .0237, .127, .407]),
+    "fokker_planck": ([.0200, .0254, .241, .368], [.0071, .0119, .105, .267]),
+}
+PAPER_METRICS = ("iid_jsd", "simulation_jsd", "iid_pmf", "simulation_pmf")
+PROTOCOL_KEYS = ("peptides", "seed", "simulation_steps", "save_every", "replicas", "eval_time",
+                 "two_for_one_time", "dt", "gamma", "temperature")
+MASS = np.repeat([14.00672, 12.01078, 12.01078, 12.01078, 15.99943] * 2, 3)
+R_GAS = .00831446261815324  # kJ mol^-1 K^-1
 
 
-@dataclass
-class EvaluationSettings:
-    seed: Optional[int] = None  # The seed for the evaluation, if None, we use the seed from the training
-    inference_bs: Optional[int] = None  # The batch size for inference
-    fp_inference_bs: Optional[int] = None  # The batch size for FP inference (often we need a smaller number here.)
-    num_iid_samples: Optional[int] = None  # The number of iid samples to generate
-    num_fp_timepoints: int = 500  # The number of timepoints at which to evaluate the FP loss
-    eval_t: float = 0.0  # The time at which the model is evaluated
-    num_langevin_intermediate_steps: int = 10  # How many langevin steps are performed to get one sample
-    num_langevin_samples: Optional[int] = None  # The number of langevin samples to generate
-    num_parallel_langevin_samples: int = 5  # How many langevin simulations are run in parallel
-    langevin_dt: Optional[float] = None  # The time step for the langevin simulation, in picoseconds
-    max_num_openmm_evaluations: int = 1_000  # The maximum number of openmm calls we do for energy evaluations
-    aldp_ensure_start_low_prob: bool = True  # Whether to ensure that one simulation starts in a low probability state
-    aldp_evaluate_forces: bool = True  # Whether to evaluate the forces of the model
-    limit_inference_peptides: Optional[Sequence[str]] = None  # If specified, only evaluate on these peptides
-    only_store_results: bool = False  # If this is true, we only store the results with minimal evaluation.
+def atomic_save(value, path):
+    path = Path(path)
+    temp = path.with_name(path.name + ".tmp")
+    torch.save(value, temp)
+    temp.replace(path)
 
 
-def evaluate(
-    model: MixtureOfModels,
-    params: FrozenDict[str, Any],
-    dataset: Dataset,
-    evaluation: EvaluationSettings,
-    orig_BS: int,
-    norm_factor: jnp.ndarray,
-    wandb: bool,
-    out_dir: str,
-):
-    sde = sdes.VP()
-    BS = orig_BS if evaluation.inference_bs is None else evaluation.inference_bs
-    num_langevin_samples = (
-        min(dataset.train.data.shape[0], 1_000_000)
-        if evaluation.num_langevin_samples is None
-        else evaluation.num_langevin_samples
-    )
+def write_json(value, path):
+    path = Path(path)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temp.replace(path)
 
-    def trained_unnormalized_score(x, features, t, *args, **kwargs):
-        """The trained score function without any normalization. This is used for sampling."""
-        return model.apply(params, x, features, t, training=False, *args, **kwargs)
 
-    # define the force function (scaled score)
-    def force(x: jnp.ndarray, features: jnp.ndarray, **kwargs) -> jnp.ndarray:
-        return (
-            dataset.kbT
-            * model.apply(
-                params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.force
-            )
-            * norm_factor
-        )
+def file_hash(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    potential = None
-    # check if the model has an energy function, and then define it
-    if model.apply(
-        params,
-        dataset.train.data[0],
-        evaluation.eval_t * jnp.ones((1,)),
-        method=model.__class__.has_energy,
-    ):
-        log.info("The model(s) and their weights allow for the evaluation of the potential.")
 
-        def potential(x, features):
-            return dataset.kbT * model.apply(
-                params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.energy
-            )
+def angles(x):
+    """Source dihedral convention and the released ten-bead phi/psi indices."""
+    x = np.asarray(x).reshape(-1, 10, 3)
+    values = []
+    for indices in ([3, 5, 6, 8], [0, 1, 3, 5]):
+        p = x[:, indices]
+        b = p[:, :-1] - p[:, 1:]
+        b[:, 0] *= -1
+        with np.errstate(invalid="ignore", divide="ignore"):
+            b1 = b[:, 1]
+            v = b[:, [0, 2]] - ((b[:, [0, 2]] * b1[:, None]).sum(-1)
+                                   / (b1 * b1).sum(-1)[:, None])[..., None] * b1[:, None]
+            v /= np.linalg.norm(v, axis=-1, keepdims=True)
+            b1 = b1 / np.linalg.norm(b1, axis=-1, keepdims=True)
+            values.append(np.arctan2((np.cross(v[:, 0], b1) * v[:, 1]).sum(-1),
+                                    (v[:, 0] * v[:, 1]).sum(-1)))
+    return np.stack(values, axis=-1)
 
-    metrics = {}
 
-    # use different evaluation functions for different datasets
-    if isinstance(dataset, ToyDataset):
-        metrics |= evaluate_toy_dataset(dataset.train, dataset, force, potential, out_dir)
-        metrics |= evaluate_toy_samples(
-            dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
-        )
-        if dataset.train.data.shape[-1] == 2:
-            metrics |= evaluate_toy_normalization_constant(model, params, out_dir)
-    elif isinstance(dataset, MuellerBrownSimulation):
-        metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
-        metrics |= evaluate_mueller_brown_samples(
-            dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
-        )
-        metrics |= simulate_mueller_brown(dataset.train, dataset, force, out_dir, seed=evaluation.seed)
-    elif isinstance(dataset, ALDPDataset):
-        inference_bs = BS
-        num_samples = (
-            min(dataset.train.data.shape[0], 100_000)
-            if evaluation.num_iid_samples is None
-            else evaluation.num_iid_samples
-        )
-        if num_samples > 0:
-            metrics |= evaluate_molecule_samples(
-                dataset,
-                dataset.train.data,
-                dataset.train.data[0].reshape(dataset.sample_shape),
-                None,
-                trained_unnormalized_score,
-                norm_factor,
-                inference_bs,
-                num_samples,
-                dataset.write_animation,
-                wandb,
-                "aldp",
-                out_dir,
-                evaluation.seed,
-                only_store_results=evaluation.only_store_results,
-            )
+def metrics(truth, samples, bins=64):
+    """Report paper definitions first, then the released evaluator's definitions.
 
-        if evaluation.aldp_evaluate_forces:
-            metrics |= evaluate_forces_aldp(dataset, force, inference_bs, wandb, out_dir)
+    Paper JSD uses add-one counts on the fixed angular domain. Paper PMF
+    uniformly averages log-proportion errors on all bins, with an additive
+    1e-6 baseline. Companion PMF uses 62 interior bins, fills only missing bins,
+    and averages with normalized mixture-probability weights, as released.
+    """
+    truth, samples = np.asarray(truth), np.asarray(samples)
+    truth = truth[np.isfinite(truth).all(axis=1)]
+    samples = samples[np.isfinite(samples).all(axis=1)]
+    if not len(truth) or not len(samples):
+        return {key: None for key in ("jsd", "js_distance", "pmf", "code_jsd", "code_pmf", "code_mjs")}
+    edges = np.linspace(-np.pi, np.pi, bins + 1)
+    p = np.histogram2d(*truth.T, bins=(edges, edges))[0].ravel()
+    q = np.histogram2d(*samples.T, bins=(edges, edges))[0].ravel()
+    ps, qs = (p + 1) / (p.sum() + bins**2), (q + 1) / (q.sum() + bins**2)
+    divergence = float(jensenshannon(ps, qs)**2)
+    pmf = np.square(np.log(p / p.sum() + 1e-6) - np.log(q / q.sum() + 1e-6)).mean()
+    both = np.concatenate((truth, samples))
+    code_edges = [np.linspace(both[:, i].min(), both[:, i].max(), bins + 1) for i in range(2)]
+    pc = np.histogram2d(*truth.T, bins=code_edges)[0].ravel()
+    qc = np.histogram2d(*samples.T, bins=code_edges)[0].ravel()
+    code_jsd = float(jensenshannon(pc, qc)**2)
+    inner_edges = np.linspace(-np.pi, np.pi, bins - 1)
+    counts = []
+    for sample in (truth, samples):
+        index = np.digitize(sample, inner_edges)
+        counts.append(np.bincount(index[:, 0] * bins + index[:, 1], minlength=bins**2) / len(sample))
+    occupied = (counts[0] + counts[1]) > 0
+    a, b = [np.where(c[occupied] > 0, c[occupied], 1e-6) for c in counts]
+    mixture = (a + b) / 2
+    weights = mixture / mixture.sum()
+    return {"jsd": divergence, "js_distance": math.sqrt(divergence), "pmf": float(pmf),
+            "code_jsd": code_jsd, "code_pmf": float((weights * (np.log(a) - np.log(b))**2).sum()),
+            "code_mjs": float((weights * (a / mixture * np.log(a / mixture)
+                                          + b / mixture * np.log(b / mixture)) / 2).sum())}
 
-        if num_langevin_samples > 0:
-            metrics |= simulate_single_system(
-                dataset.train,
-                dataset,
-                force,
-                evaluation.num_parallel_langevin_samples,
-                num_langevin_samples,
-                evaluation.num_langevin_intermediate_steps,
-                evaluation.langevin_dt,
-                evaluation.max_num_openmm_evaluations,
-                evaluation.aldp_ensure_start_low_prob,
-                wandb,
-                out_dir,
-                "aldp",
-                evaluation.seed,
-                only_store_results=evaluation.only_store_results,
-            )
 
-    elif isinstance(dataset, CGMinipeptideDataset):
-        inference_bs = BS
-
-        if dataset.val is None:
-            datapoints = dataset.train
-            current_out_folder = os.path.join(out_dir, "train")
+def make_score(model, compile_model=False):
+    """Use a static expert to avoid a GPU synchronization in mixture routing."""
+    functions = []
+    for expert in model.experts:
+        if expert.potential:
+            gradient = torch.func.grad(lambda x, features, t, expert=expert:
+                                       -expert._differentiable_forward(x, features, t).sum())
+            def call(x, features, t, gradient=gradient):
+                centered = x.reshape(-1, 10, 3)
+                centered = (centered - centered.mean(dim=1, keepdim=True)).reshape_as(x)
+                return gradient(centered, features, t)
         else:
-            datapoints = dataset.val
-            current_out_folder = os.path.join(out_dir, "validation")
+            def call(x, features, t, expert=expert):
+                centered = x.reshape(-1, 10, 3)
+                centered = (centered - centered.mean(dim=1, keepdim=True)).reshape_as(x)
+                return -expert._differentiable_forward(centered, features, t).reshape_as(x)
+        functions.append(torch.compile(call, fullgraph=True, dynamic=False) if compile_model else call)
 
-        metrics |= evaluate_peptide_samples(
-            datapoints,
-            evaluation.limit_inference_peptides,
-            dataset,
-            trained_unnormalized_score,
-            norm_factor,
-            evaluation.num_iid_samples,
-            inference_bs,
-            wandb,
-            current_out_folder,
-            evaluation.seed,
-        )
-
-        if num_langevin_samples > 0:
-            metrics |= simulate_minipeptide(
-                datapoints,
-                evaluation.limit_inference_peptides,
-                dataset,
-                force,
-                evaluation.num_parallel_langevin_samples,
-                num_langevin_samples,
-                evaluation.num_langevin_intermediate_steps,
-                evaluation.langevin_dt,
-                wandb,
-                current_out_folder,
-                evaluation.seed,
-                only_store_results=evaluation.only_store_results,
-            )
-    elif isinstance(dataset, SingleProteinDataset):
-        inference_bs = BS
-        num_samples = (
-            min(dataset.train.data.shape[0], 100_000)
-            if evaluation.num_iid_samples is None
-            else evaluation.num_iid_samples
-        )
-        if num_samples > 0:
-            metrics |= evaluate_molecule_samples(
-                dataset,
-                dataset.train.data,
-                dataset.train.data[0].reshape(dataset.sample_shape),
-                None,
-                trained_unnormalized_score,
-                norm_factor,
-                inference_bs,
-                num_samples,
-                None,
-                wandb,
-                dataset.name,
-                out_dir,
-                evaluation.seed,
-                only_store_results=evaluation.only_store_results,
-            )
-
-        if num_langevin_samples > 0:
-            metrics |= simulate_single_system(
-                dataset.train,
-                dataset,
-                force,
-                evaluation.num_parallel_langevin_samples,
-                num_langevin_samples,
-                evaluation.num_langevin_intermediate_steps,
-                evaluation.langevin_dt,
-                evaluation.max_num_openmm_evaluations,
-                False,
-                wandb,
-                out_dir,
-                dataset.name,
-                evaluation.seed,
-                only_store_results=evaluation.only_store_results,
-            )
-
-    FP_BS = evaluation.fp_inference_bs if evaluation.fp_inference_bs is not None else BS
-    if evaluation.num_fp_timepoints > 0:
-        metrics |= evaluate_fp_loss(
-            dataset.train[jax.random.permutation(jax.random.PRNGKey(0), len(dataset.train))[:FP_BS]],
-            evaluation.num_fp_timepoints,
-            norm_factor,
-            model,
-            params,
-            trained_unnormalized_score,
-            sde,
-            wandb,
-            out_dir,
-        )
-
-    if wandb and len(metrics) > 0:
-        wandb_lib.log(metrics)
-
-    # write metrics to file
-    with open(os.path.join(out_dir, "metrics.json"), "w") as f:
-        # Skip values that are not JSON serializable
-        serializable_metrics = {}
-        for key, value in metrics.items():
-            try:
-                # Test if the value is JSON serializable
-                json.dumps({key: value})
-                serializable_metrics[key] = value
-            except (TypeError, OverflowError):
-                log.warning(f"Skipping non-serializable metric: {key}")
-
-        json.dump(serializable_metrics, f)
-
-    log.info(f"Metrics: {metrics}")
-    log.info(f"Finished evaluation. You can find the results in {out_dir}")
-    return metrics
+    def score(x, features, t, scalar_time):
+        active = [i for i, (hi, lo) in enumerate(model.ranges) if lo <= scalar_time <= hi]
+        return sum(functions[i](x, features, t) for i in active) / len(active)
+    return score
 
 
-def evaluate_fp_loss(
-    data_points: Datapoints,
-    num_fp_timepoints: int,
-    norm_factor: jnp.ndarray,
-    model: MixtureOfModels,
-    params: FrozenDict[str, Any],
-    unnormalized_score: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
-    sde: sdes.VP,
-    wandb: bool,
-    out_dir: str,
-) -> dict:
-    data = data_points.data
-    data *= norm_factor  # convert the data to the correct scale
-
-    vs, ss = [], []
-    key = jax.random.PRNGKey(0)
-
-    if hasattr(model, "log_q_and_score") and hasattr(model, "log_q"):
-
-        def log_q_and_score_fn(x, features, t):
-            return model.apply(
-                params,
-                x,
-                features,
-                t,
-                training=False,
-                evaluated_models=model.energy_models(),
-                method=model.__class__.log_q_and_score,
-            )
-
-        def log_q_fn(x, features, t):
-            return model.apply(
-                params,
-                x,
-                features,
-                t,
-                training=False,
-                evaluated_models=model.energy_models(),
-                method=model.__class__.log_q,
-            )
-    else:
-        log_q_and_score_fn = None
-        log_q_fn = None
-
-    D = data.shape[-1]
-    log.warning("Hardcoded likelihood weighting to False")
-
-    @partial(jax.jit, static_argnums=(1,))
-    def fp_vp_error_at_t(
-        t: jnp.ndarray, scalar: bool
-    ):  # we intentially use the same key for all t to make the evaluation reproducible
-        x, _, _ = perturb(t, sde, key, data)
-        vector_error, scalar_error, _ = fp_vp_error(
-            key,
-            sde,
-            unnormalized_score,
-            log_q_fn,
-            log_q_and_score_fn,
-            x,
-            data_points.features,
-            t * jnp.ones((x.shape[0], 1)),
-            True,
-            scalar,
-            div_est=2,
-            unbiased=False,
-        )
-        return jnp.mean(jnp.sqrt(vector_error)) / D, jnp.mean(jnp.sqrt(scalar_error)) / D
-
-    ts = jnp.linspace(0, 1, num_fp_timepoints)
-    for t in tqdm(ts, desc="Evaluating FP Error"):
-        scalar = (
-            False
-            if log_q_and_score_fn is None and log_q_fn is None
-            else model.apply(params, data, t * jnp.ones((1,)), method=model.__class__.has_energy)
-        )
-
-        vector_error, scalar_error = fp_vp_error_at_t(t * jnp.ones((data.shape[0], 1)), scalar)
-        vs.append(vector_error)
-        ss.append(scalar_error)
-
-    plt.figure(clear=True)
-    plt.title("Vector FP Error (alpha)")
-    plt.plot(ts[1:-1], vs[1:-1])
-    plt.xlim(0, 1)
-    plt.savefig(f"{out_dir}/vector_fp_error.png", bbox_inches="tight")
-    plt.close()
-
-    onp.save(f"{out_dir}/vector_fp_error.npy", vs)
-
-    if jnp.nansum(jnp.abs(jnp.array(ss))) > 0:  # if there is any conservative model
-        plt.figure(clear=True)
-        plt.title("Scalar FP Error (beta)")
-        plt.plot(ts[1:-1], ss[1:-1])
-        plt.xlim(0, 1)
-        plt.savefig(f"{out_dir}/scalar_fp_error.png", bbox_inches="tight")
-        plt.close()
-
-        onp.save(f"{out_dir}/scalar_fp_error.npy", ss)
-
-    if wandb:
-        wandb_lib.define_metric("eval/vector_fp_error", step_metric="eval/time")
-        wandb_lib.define_metric("eval/scalar_fp_error", step_metric="eval/time")
-        for i in range(ts.shape[0]):
-            wandb_lib.log({"eval/vector_fp_error": vs[i], "eval/scalar_fp_error": ss[i], "eval/time": ts[i]})
-
-    return {}
+def load_model(config, method, device, checkpoint=None):
+    trained_method = "diffusion" if method == "two_for_one" else method
+    root = Path(config["data"].get("root", "data"))
+    checkpoint = Path(checkpoint) if checkpoint else root / "runs" / trained_method / f"seed{config['training']['seed']}" / "final.pt"
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if state.get("method", trained_method) != trained_method:
+        raise ValueError(f"Expected {trained_method} checkpoint, got {state.get('method')} in {checkpoint}")
+    model = DipeptideModel(trained_method, state.get("config", config)).to(device)
+    model.load_state_dict(state.get("ema", state["model"]))
+    model.eval().requires_grad_(False)
+    return model, float(state["norm_factor"]), checkpoint, file_hash(checkpoint)
 
 
-def evaluate_peptide_samples(
-    datapoints: PeptideDatapoints,
-    limit_inference_peptides: Optional[Sequence[str]],
-    dataset: CGMinipeptideDataset,
-    trained_unnormalized_score: Callable,
-    norm_factor: jnp.ndarray,
-    num_iid_samples: Optional[int],
-    inference_bs: int,
-    wandb: bool,
-    out_dir: str,
-    seed: int,
-):
-    os.makedirs(out_dir, exist_ok=True)
-    metrics = {}
-    current_idx = 0
-    for peptide, peptide_length in zip(datapoints.peptides, datapoints.peptide_lengths):
-        next_idx = current_idx + peptide_length
-        num_samples = min(peptide_length, 100_000) if num_iid_samples is None else num_iid_samples
-        if num_samples <= 0:
+def cache_inference_checked(model, split, config, norm, device):
+    sequence = config["evaluation"]["peptides"][0]
+    x = torch.tensor(np.asarray(split[sequence]["x"][:2]), device=device) * norm
+    features = torch.as_tensor(split[sequence]["features"], device=device).unsqueeze(0).expand(len(x), -1, -1)
+    times = (.03, .35, .8) if model.method == "mixture" else (.02,)
+    references = [model(x, features, torch.full((len(x), 1), t, device=device)).detach() for t in times]
+    model.enable_inference_cache()
+    for scalar_time, reference in zip(times, references):
+        actual = model(x, features, torch.full((len(x), 1), scalar_time, device=device))
+        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
+
+
+def reverse_diffusion(score, features, n, steps, generator, norm_factor):
+    """Released VP Euler-Maruyama: inclusive time grid, noise also at t=0."""
+    device = features.device
+    x = torch.randn(n, 30, device=device, generator=generator)
+    dt = torch.tensor(1 / (steps - 1), dtype=x.dtype, device=device)
+    for scalar_time in np.linspace(0, 1, steps, dtype=np.float32)[::-1]:
+        t = torch.full((n, 1), float(scalar_time), device=device)
+        beta = .1 + t * (20 - .1)
+        force = score(x, features, t, float(scalar_time))
+        diffusion = torch.sqrt(beta)
+        drift = .5 * beta * x + diffusion.square() * force
+        x = (x + drift * dt + diffusion * torch.sqrt(dt)
+             * torch.randn(x.shape, device=device, generator=generator)).detach()
+    return x / norm_factor
+
+
+def generate_iid(config, split, model, norm, checkpoint_hash, directory, device, compiled=False):
+    settings = config["evaluation"]
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = {"checkpoint": checkpoint_hash, "norm_factor": norm, "samples": settings["num_iid_samples"],
+                "steps": settings["diffusion_steps"], "seed": settings["seed"], "batch": settings["inference_batch"],
+                "compiled": compiled, "inference_cache": model.experts[0]._inference_cache}
+    metadata = directory / "iid_metadata.json"
+    if metadata.exists() and json.loads(metadata.read_text()) != identity:
+        raise ValueError(f"IID settings/checkpoint differ from {metadata}; use a fresh output directory")
+    write_json(identity, metadata)
+    score = make_score(model, compiled)
+    for sequence in settings["peptides"]:
+        count, batch = settings["num_iid_samples"], settings["inference_batch"]
+        path, state_path = directory / f"{sequence}_iid.npy", directory / f"{sequence}_iid_state.pt"
+        state = torch.load(state_path, weights_only=False) if state_path.exists() else None
+        if state and state.get("identity") != identity:
+            raise ValueError(f"IID checkpoint/settings differ from saved state: {state_path}")
+        done = state["completed"] if state else 0
+        if done == count:
             continue
-
-        if limit_inference_peptides is not None and peptide not in limit_inference_peptides:
-            log.info(f"Skipping peptide {peptide}")
-        else:
-            log.info(f"Generating and evaluating {num_samples} samples for peptide {peptide}")
-            metrics |= evaluate_molecule_samples(
-                dataset,
-                datapoints.data[current_idx:next_idx],
-                datapoints.data[current_idx].reshape(dataset.sample_shape),
-                datapoints.features[current_idx : current_idx + 1].repeat(num_samples, axis=0),
-                trained_unnormalized_score,
-                norm_factor,
-                inference_bs,
-                num_samples,
-                lambda x, out_dir: dataset.write_animation(x, peptide, out_dir),
-                wandb,
-                peptide,
-                out_dir,
-                seed,
-            )
-
-            # free unused memory
-            gc.collect()
-
-        current_idx = next_idx
-
-    return metrics
+        array = np.lib.format.open_memmap(path, mode="r+" if state else "w+", dtype="float32", shape=(count, 30))
+        generator = torch.Generator(device=device).manual_seed(settings["seed"])
+        if state:
+            generator.set_state(state["rng"])
+        feature = torch.as_tensor(split[sequence]["features"], dtype=torch.long, device=device)
+        start_time = time.monotonic()
+        while done < count:
+            n = min(batch, count - done)
+            features = feature.unsqueeze(0).expand(n, -1, -1)
+            x = reverse_diffusion(score, features, n, settings["diffusion_steps"], generator, norm)
+            array[done:done + n] = x.cpu().numpy()
+            done += n
+            array.flush()
+            atomic_save({"completed": done, "rng": generator.get_state(), "identity": identity}, state_path)
+            print(f"IID {sequence}: {done}/{count}, {(time.monotonic() - start_time):.1f} s this session", flush=True)
 
 
-def get_samples(
-    shape: jnp.ndarray,
-    features: Optional[jnp.ndarray],
-    score: Callable,
-    norm_factor: jnp.ndarray,
-    seed: int,
-    BS: Optional[int] = None,
-    t0: float = 0.0,
-) -> jnp.ndarray:
-    from scoremd.diffusion.classic.utils import get_times, get_sampler
-    from scoremd.diffusion.classic.solvers import EulerMaruyama
-
-    log.info(f"Generating {shape[0]} samples ...")
-
-    updated_shape = shape if BS is None else (BS, *shape[1:])
-
-    log.warning("Hardcoded SDE to VP, in case you want to change it, also change it here")
-    rsde = sdes.VP().reverse(score)
-    ts, _ = get_times(num_steps=1000, t0=t0)
-    outer_solver = EulerMaruyama(rsde, ts)
-
-    q_samples = []
-    key = jax.random.PRNGKey(seed)
-
-    sampler = get_sampler(updated_shape, outer_solver, denoise=False, inverse_scaler=lambda x: x)
-
-    step_size = shape[0] if BS is None else BS
-    num_steps = math.ceil(shape[0] / BS) if BS is not None else 1
-
-    # we need to pad the features to the same length as num_steps * step_size
-    if features is not None:
-        log.info(f"Padding features to {num_steps * step_size} length")
-        features = jnp.pad(
-            features, ((0, num_steps * step_size - features.shape[0]), *([(0, 0)] * (features.ndim - 1)))
-        )
-        log.info(f"Features new shape: {features.shape}")
-
-    def sample_batch(carry, features):
-        key, _ = carry
-        key, sample_key = jax.random.split(key)
-
-        return (key, None), sampler(sample_key, features)[0]
-
-    init_carry = (key, None)
-    _, q_samples = jax.lax.scan(
-        sample_batch,
-        init_carry,
-        features.reshape(num_steps, step_size, *features.shape[1:]) if features is not None else None,
-        length=num_steps,
-    )
-
-    q_samples = q_samples.reshape(-1, q_samples.shape[-1])
-
-    # filter out nan values
-    nan_entries = jnp.isnan(q_samples).any(axis=1)
-    if nan_entries.sum() > 0:
-        log.warning(f"Found {nan_entries.sum()} NaN entries. Filtering them out...")
-
-        q_samples = q_samples[~nan_entries]
-    q_samples /= norm_factor
-
-    if q_samples.shape[0] > shape[0]:
-        q_samples = q_samples[: shape[0]]
-
-    log.info(f"{q_samples.shape[0]} samples remaining")
-
-    return q_samples
+def langevin_step(x, v, noise, score, features, t, scalar_time, norm, mass, kbt, alpha, force_scale, dt):
+    force = kbt * norm * score(x * norm, features, t, scalar_time)
+    v_new = alpha * v + force_scale * force / mass + torch.sqrt(kbt * (1 - alpha**2) / mass) * noise
+    return (x + dt * v_new).detach(), v_new.detach()
 
 
-def evaluate_toy_dataset(
-    datapoints: Datapoints,
-    dataset: ToyDataset,
-    force_with_features: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
-    potential_net_with_features: Optional[Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]],
-    out_dir: str,
-):
-    assert datapoints.features is None
+def capture_step(step, x, v, generator):
+    """Capture deterministic arithmetic; keep noise outside for exact RNG resume."""
+    noise = torch.zeros_like(x)
+    static_x, static_v = x.clone(), v.clone()
+    stream = torch.cuda.Stream(device=x.device)
+    stream.wait_stream(torch.cuda.current_stream(x.device))
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            a, b = step(static_x, static_v, noise)
+            static_x.copy_(a)
+            static_v.copy_(b)
+    torch.cuda.current_stream(x.device).wait_stream(stream)
+    static_x.copy_(x)
+    static_v.copy_(v)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.device(x.device), torch.cuda.graph(graph):
+        a, b = step(static_x, static_v, noise)
+        static_x.copy_(a)
+        static_v.copy_(b)
+    # Capturing executes a step; restore the initial state before replay.
+    static_x.copy_(x)
+    static_v.copy_(v)
+    noise.normal_(generator=generator)
+    expected_x, expected_v = step(x, v, noise)
+    graph.replay()
+    torch.cuda.synchronize(x.device)
+    torch.testing.assert_close(static_x, expected_x, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(static_v, expected_v, rtol=2e-5, atol=2e-6)
+    static_x.copy_(x)
+    static_v.copy_(v)
+    def replay():
+        noise.normal_(generator=generator)
+        graph.replay()
+        return static_x, static_v
+    return static_x, static_v, replay
 
-    def force(x):
-        return force_with_features(x, None)
 
-    if potential_net_with_features is not None:
+def simulation_setup(config, split, model, norm, device, compiled):
+    settings = config["evaluation"]
+    generator = torch.Generator(device=device).manual_seed(settings["seed"])
+    starting, features = [], []
+    for sequence in settings["peptides"]:
+        array = split[sequence]["x"]
+        indices = np.random.default_rng(settings["seed"]).permutation(len(array))[:settings["replicas"]]
+        if len(indices) < settings["replicas"]:
+            raise ValueError(f"Not enough starting frames for {sequence}")
+        starting.append(np.asarray(array[indices]).reshape(len(indices), 30))
+        features.append(np.broadcast_to(split[sequence]["features"], (len(indices), 10, 4)).copy())
+    x = torch.as_tensor(np.concatenate(starting), dtype=torch.float32, device=device)
+    features = torch.as_tensor(np.concatenate(features), dtype=torch.long, device=device)
+    mass = torch.as_tensor(MASS, dtype=torch.float32, device=device)
+    kbt = R_GAS * settings["temperature"]
+    v = torch.sqrt(kbt / mass) * torch.randn(x.shape, device=device, generator=generator)
+    scalar_time = settings["two_for_one_time"] if model.method == "two_for_one" else settings["eval_time"]
+    t = torch.full((len(x), 1), scalar_time, device=device)
+    score = make_score(model, compiled)
+    with torch.enable_grad():
+        reference = model(x * norm, features, t, create_graph=False).detach()
+    torch.testing.assert_close(score(x * norm, features, t, scalar_time), reference, rtol=2e-5, atol=2e-5)
+    alpha = torch.exp(torch.tensor(-settings["gamma"] * settings["dt"], dtype=x.dtype, device=device))
+    def step(x, v, noise):
+        return langevin_step(x, v, noise, score, features, t, scalar_time, norm, mass, kbt,
+                             alpha, (1 - alpha) / settings["gamma"], settings["dt"])
+    return x, v, generator, step
 
-        def potential_net(x):
-            return potential_net_with_features(x, None)
+
+def simulate(config, split, model, norm, checkpoint_hash, directory, device, compiled=False,
+             cuda_graphs=False, profile_steps=0):
+    settings = config["evaluation"]
+    if settings["simulation_steps"] % settings["save_every"]:
+        raise ValueError("simulation_steps must be divisible by save_every")
+    nframes = settings["simulation_steps"] // settings["save_every"]
+    identity = {"checkpoint": checkpoint_hash, "norm_factor": norm,
+                **{key: settings[key] for key in PROTOCOL_KEYS}, "method": model.method,
+                "compiled": compiled, "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache}
+    directory.mkdir(parents=True, exist_ok=True)
+    metadata = directory / "simulation_metadata.json"
+    if not profile_steps and metadata.exists() and json.loads(metadata.read_text()) != identity:
+        raise ValueError(f"Simulation settings/checkpoint differ from {metadata}; use a fresh output directory")
+    x, v, generator, step = simulation_setup(config, split, model, norm, device, compiled)
+    state_path = directory / "simulation_state.pt"
+    state = torch.load(state_path, weights_only=False) if state_path.exists() and not profile_steps else None
+    if state and state.get("identity") != identity:
+        raise ValueError(f"Simulation checkpoint/settings differ from saved state: {state_path}")
+    completed = state["completed"] if state else 0
+    alive = state["alive"] if state else np.ones(len(x), dtype=bool)
+    if state:
+        x.copy_(state["x"].to(device))
+        v.copy_(state["v"].to(device))
+        generator.set_state(state["rng"])
+    if completed == settings["simulation_steps"] and not profile_steps:
+        return
+    if cuda_graphs:
+        if device.type != "cuda":
+            raise ValueError("--cuda-graphs requires a CUDA device")
+        # capture_step consumes one test noise draw; restoring makes its setup RNG-neutral.
+        rng = generator.get_state()
+        x, v, replay = capture_step(step, x, v, generator)
+        generator.set_state(rng)
     else:
-        potential_net = None
-
-    metrics = {}
-    if datapoints.data.shape[-1] == 1:
-        plt.figure(figsize=(10, 4), clear=True)
-
-        plt.subplot(1, 2, 1)
-        dataset.plot_potential_evaluation(potential_net)
-
-        plt.subplot(1, 2, 2)
-        dataset.plot_force_evaluation(force)
-
-        plt.savefig(f"{out_dir}/1d-results.png", bbox_inches="tight")
-        plt.close()
-
-    if datapoints.data.shape[-1] == 2:
-        plt.figure(figsize=(12, 10), clear=True)
-        ax0, _, ax2, _ = dataset.plot_potential_evaluation(potential_net)
-        save_parts_of_figure(
-            ax0,
-            f"{out_dir}/2d-results-density-ground-truth.pdf",
-            title=False,
-            xticks=False,
-            yticks=False,
-            xlabel=False,
-            ylabel=False,
-            dpi=DPI,
-        )
-        save_parts_of_figure(
-            ax2,
-            f"{out_dir}/2d-results-density-learned.pdf",
-            title=False,
-            xticks=False,
-            yticks=False,
-            xlabel=False,
-            ylabel=False,
-            dpi=DPI,
-        )
-        plt.savefig(f"{out_dir}/2d-results-potential.png", bbox_inches="tight")
-        plt.close()
-
-        plt.figure(clear=True)
-        dataset.plot_force_evaluation(force)
-        plt.savefig(f"{out_dir}/2d-results-forces.png", bbox_inches="tight")
-        plt.close()
-
-        if potential_net and dataset.example is ToyDatasets.DoubleWell2D:
-            from scoremd.data.dataset.toy import _double_well_2d_density
-
-            (x_min, x_max), (y_min, y_max) = dataset.example.range()
-
-            n = 100j
-            xx, yy = jnp.mgrid[x_min:x_max:n, y_min:y_max:n]
-            positions = jnp.vstack([xx.ravel(), yy.ravel()]).T
-
-            def compute_mass(positions, values):
-                upper_right = positions[:, 1] > -positions[:, 0]
-                return (values[upper_right]).sum(), (values[~upper_right]).sum()
-
-            ff = potential_net(positions)
-            ff = jnp.exp(-ff + ff.min())
-            mass_a, mass_b = compute_mass(positions, ff.reshape(-1, 1))
-            mass_a_baseline, mass_b_baseline = compute_mass(positions, _double_well_2d_density(positions))
-
-            metrics |= {
-                "eval/relative_mass_distribution": (mass_a / (mass_a + mass_b)).item(),
-            }
-
-            log.info(
-                f"{mass_a / (mass_a + mass_b) * 100:.2f}% of the learned potential mass lies above the diagonal threshold. This should be {mass_a_baseline / (mass_a_baseline + mass_b_baseline) * 100:.2f}%"
-            )
-
-    return metrics
-
-
-def evaluate_toy_normalization_constant(
-    model: MixtureOfModels,
-    params: FrozenDict[str, Any],
-    out_dir: str,
-):
-    # we now estimate the normalization constant Z
-    # we draw a batch of samples from the learned potential
-    test_ts = jnp.linspace(0.0, 1.0, 100)
-
-    N = 100
-    x0, x1 = -10, 10
-    y0, y1 = -10, 10
-
-    x = jnp.linspace(x0, x1, N)
-    y = jnp.linspace(y0, y1, N)
-
-    dx = (x1 - x0) / (N - 1)
-    dy = (y1 - y0) / (N - 1)
-
-    xx, yy = jnp.meshgrid(x, y)
-    samples = jnp.concatenate([xx.reshape(-1, 1), yy.reshape(-1, 1)], axis=1)
-
-    def log_q_fn(x, features, t):
-        return model.apply(
-            params,
-            x,
-            features,
-            t,
-            False,
-            model.energy_models(),
-            # rngs={"dropout": jax.random.PRNGKey(0)}, we don't need this here, because we don't train
-            method=model.__class__.log_q,
-        )
-
-    Zs = []
-    Z_grads = []
-
-    def compute_Z(t):
-        log_q = log_q_fn(samples, None, t)
-        q = jnp.exp(log_q)
-
-        # integrate over the grid
-        Z = q.sum() * dx * dy
-        return jnp.log(Z)
-
-    Z_grad_t = jax.grad(compute_Z)
-
-    for t in tqdm(test_ts):
-        Z = compute_Z(t * jnp.ones((samples.shape[0], 1)))
-        Z_grad = Z_grad_t(t * jnp.ones((samples.shape[0], 1))).mean()
-        Zs.append(Z)
-        Z_grads.append(Z_grad)
-
-    plt.figure(clear=True)
-    plt.plot(test_ts, Zs)
-    plt.xlabel(r"$t$")
-    plt.ylabel(r"$Z_t$")
-    plt.savefig(f"{out_dir}/Z-estimation.png", bbox_inches="tight")
-    plt.close()
-
-    plt.figure(clear=True)
-    plt.plot(test_ts, Z_grads)
-    plt.xlabel(r"$t$")
-    plt.ylabel(r"$\partial_t Z_t$")
-    plt.savefig(f"{out_dir}/Z-grad-estimation.png", bbox_inches="tight")
-    plt.close()
-
-    return {"eval/Z": jnp.log(jnp.array(Zs).mean())}
-
-
-def evaluate_toy_samples(
-    datapoints: Datapoints, dataset: ToyDataset, score: Callable, norm_factor: jnp.ndarray, out_dir: str, seed: int
-):
-    q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)
-    outliers = (jnp.abs(q_samples) > 20).sum(axis=1) > 0
-    if outliers.sum() > 0:
-        log.warning(f"There are {outliers.mean() * 100:.3f}% outliers. Filtering them out...")
-
-    q_samples = q_samples[~outliers]
-
-    if datapoints.data.shape[-1] == 1:
-        plt.figure(figsize=(10, 4), clear=True)
-
-        plt.subplot(1, 2, 1)
-        plt.title("Histogram of new samples")
-        plt.hist(q_samples, bins=100)
-
-        plt.subplot(1, 2, 2)
-        plt.title("KDE approximation of samples")
-        kde_sampled = gaussian_kde(q_samples.T)
-
-        x_min, x_max = dataset.example.range()
-        xx = jnp.linspace(x_min, x_max, 1000)
-        xx = xx.reshape(-1, 1)
-
-        kde = gaussian_kde(datapoints.data.reshape(-1))
-        vv_true = -jnp.log(kde(xx.reshape(-1)))
-
-        vv_sampled = -jnp.log(kde_sampled(xx.reshape(-1)))
-        plt.plot(xx, vv_sampled - vv_sampled.min(), label="KDE of samples")
-        plt.plot(xx, vv_true - vv_true.min(), label="truth")
-        plt.legend()
-        plt.savefig(f"{out_dir}/1d-sampled.png", bbox_inches="tight")
-        plt.close()
-    elif datapoints.data.shape[-1] == 2:
-        plt.figure(clear=True)
-        plt.title("Sampled data")
-
-        (x_min, x_max), (y_min, y_max) = dataset.example.range()
-
-        # filter out all points that are not within x_min, x_max, y_min, y_max
-        plot_q_samples = q_samples[
-            (q_samples[:, 0] >= x_min)
-            & (q_samples[:, 0] <= x_max)
-            & (q_samples[:, 1] >= y_min)
-            & (q_samples[:, 1] <= y_max)
-        ]
-
-        if dataset.example is ToyDatasets.DoubleWell2D:
-            log.info(
-                f"{(q_samples[:, 1] > -q_samples[:, 0]).mean() * 100:.2f}% of sampled mass lies above the diagonal threshold. This should be 80%"
-            )
-
-        plt.hist2d(plot_q_samples[:, 0], plot_q_samples[:, 1], bins=100)
-        if dataset.example is ToyDatasets.DoubleWell2D:
-            plt.scatter([-5, 5], [-5, 5], marker="*", color="red")
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min, y_max)
-        plt.savefig(f"{out_dir}/2d-sampled.png", bbox_inches="tight")
-        plt.close()
-
-    return {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
-
-
-def evaluate_mueller_brown(
-    dataset: MuellerBrownSimulation,
-    force_with_features: Callable[[jnp.ndarray], jnp.ndarray],
-    potential_net_with_features: Optional[Callable[[jnp.ndarray], jnp.ndarray]],
-    out_dir: str,
-):
-    def force(x):
-        return force_with_features(x, None)
-
-    if potential_net_with_features is not None:
-
-        def potential_net(x):
-            return potential_net_with_features(x, None)
-    else:
-        potential_net = None
-
-    plt.figure(figsize=(12, 10), clear=True)
-    plot_potential_2d(dataset.potential, dataset.likelihood, potential_net, *dataset.range())
-    plt.savefig(f"{out_dir}/mueller-brown-results-potential.png", bbox_inches="tight")
-    plt.close()
-
-    plt.figure(clear=True)
-    ground_truth_force = jax.grad(lambda x: -dataset.potential(x).sum())
-    plot_force_2d(force, ground_truth_force, *dataset.range())
-    plt.savefig(f"{out_dir}/mueller-brown-results-forces.png", bbox_inches="tight")
-    plt.close()
-    plt.figure(clear=True)
-    plot_force_2d(force, ground_truth_force, *dataset.range(), equal_scaling=False)
-    plt.savefig(f"{out_dir}/mueller-brown-results-forces-autoscale.png", bbox_inches="tight")
-    plt.close()
-
-    return {}
-
-
-def evaluate_mueller_brown_samples(
-    datapoints: Datapoints,
-    dataset: MuellerBrownSimulation,
-    score: Callable,
-    norm_factor: jnp.ndarray,
-    out_dir: str,
-    seed: int,
-):
-    q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)
-    outliers = (jnp.abs(q_samples) > 20).sum(axis=1) > 0
-    if outliers.sum() > 0:
-        log.warning(f"There are {outliers.mean() * 100:.3f}% outliers. Filtering them out...")
-
-    q_samples = q_samples[~outliers]
-
-    plt.figure(figsize=(12, 4), clear=True)
-
-    plt.subplot(1, 2, 1)
-    plt.title("Ground Truth Samples")
-    dataset.plot(datapoints.data)
-
-    plt.subplot(1, 2, 2)
-    plt.title("New Samples")
-    dataset.plot(q_samples)
-
-    plt.savefig(f"{out_dir}/mueller-brown-samples.png", bbox_inches="tight")
-    plt.close()
-
-    # paper figures
-    plt.figure(clear=True)
-    dataset.plot(q_samples, cbar_range=(0, 152.5), cbar=False)
-    plt.savefig(f"{out_dir}/mueller-brown-iid.pdf", bbox_inches="tight", dpi=DPI)
-    plt.close()
-
-    rms_fe_sq_error, rms_mjs_error = helper_metrics_2d(
-        datapoints.data[:, 0],
-        datapoints.data[:, 1],
-        q_samples[:, 0],
-        q_samples[:, 1],
-        limits_x=dataset.range()[0],
-        limits_y=dataset.range()[1],
-    )
-
-    return {
-        "eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100),
-        "eval/iid_rms_fe_sq_error": rms_fe_sq_error,
-        "eval/iid_rms_mjs_error": rms_mjs_error,
-    }
-
-
-def simulate_mueller_brown(
-    datapoints: Datapoints,
-    dataset: MuellerBrownSimulation,
-    force: Callable[[jnp.ndarray], jnp.ndarray],
-    out_dir: str,
-    seed: int,
-):
-    key = jax.random.PRNGKey(seed)
-    key, velocity_key = jax.random.split(key)
-
-    n_samples = 100_000  # number of samples to generate
-
-    starting_point = jnp.array([-0.55828035, 1.44169])
-    starting_velocity = jnp.sqrt(dataset.kbT / dataset.mass) * jax.random.normal(velocity_key, (2,))
-
-    @jax.jit
-    def adjusted_force(x):
-        # we don't have any features for toy datasets
-        return force(x.reshape(1, -1), None).reshape(-1)
-
-    n_steps = 50
-    step = jax.jit(
-        create_langevin_step_function(adjusted_force, dataset.mass, dataset.gamma, n_steps, dataset.dt, dataset.kbT)
-    )
-
-    log.info(f"Simulating {n_samples} MD steps with {n_steps} intermediate steps")
-    trajectory, velocities = simulate(starting_point, starting_velocity, step, n_samples, key)
-    forces = jnp.array([adjusted_force(x) for x in trajectory])
-
-    plt.figure(clear=True)
-    plt.hist(jnp.linalg.norm(forces, axis=1), bins=100)
-    plt.xlabel("Force Norm")
-    plt.ylabel("Count")
-    plt.savefig(f"{out_dir}/mueller-brown-forces-histogram.png", bbox_inches="tight")
-    plt.close()
-
-    plt.figure(figsize=(12, 4), clear=True)
-
-    plt.subplot(1, 2, 1)
-    plt.title("Ground Truth Samples")
-    dataset.plot(datapoints.data)
-
-    plt.subplot(1, 2, 2)
-    plt.title("New Samples")
-    dataset.plot(trajectory)
-
-    plt.savefig(f"{out_dir}/mueller-brown-langevin.png", bbox_inches="tight")
-    plt.close()
-
-    # paper figures
-    plt.figure(clear=True)
-    dataset.plot(datapoints.data, cbar_range=(0, 152.5), cbar=False)
-    plt.savefig(f"{out_dir}/mueller-brown-langevin-ground-truth.pdf", bbox_inches="tight", dpi=200)
-    plt.close()
-
-    plt.figure(clear=True)
-    dataset.plot(trajectory, cbar_range=(0, 152.5), cbar=False)
-    plt.savefig(f"{out_dir}/mueller-brown-langevin.pdf", bbox_inches="tight", dpi=200)
-    plt.close()
-
-    rms_fe_sq_error, rms_mjs_error = helper_metrics_2d(
-        datapoints.data[:, 0],
-        datapoints.data[:, 1],
-        trajectory[:, 0],
-        trajectory[:, 1],
-        limits_x=dataset.range()[0],
-        limits_y=dataset.range()[1],
-    )
-    return {
-        "eval/langevin_js_divergence": js_divergence(datapoints.data, trajectory, bins=100),
-        "eval/langevin_rms_fe_sq_error": rms_fe_sq_error,
-        "eval/langevin_rms_mjs_error": rms_mjs_error,
-    }
-
-
-def simulate_single_system(
-    datapoints: Datapoints,
-    dataset: ALDPDataset | SingleProteinDataset,
-    force: Callable[[jnp.ndarray], jnp.ndarray],
-    n_points: int,
-    n_samples: int,
-    n_steps: int,
-    langevin_dt: Optional[float],
-    max_num_openmm_evaluations: int,
-    aldp_ensure_start_low_prob: bool,
-    wandb: bool,
-    out_dir: str,
-    prefix: str,
-    seed: int,
-    only_store_results: bool = False,
-) -> dict:
-    if datapoints.data.shape[0] < n_points:
-        data = jnp.repeat(datapoints.data, n_points, axis=0)
-    else:
-        data = datapoints.data
-
-    initial_positions = data[:n_points]
-
-    if isinstance(dataset, ALDPDataset) and aldp_ensure_start_low_prob:
-        ground_truth_phi, ground_truth_psi = dataset.get_2d_features(data)
-        is_low_probability = (
-            (ground_truth_phi > 0.0) & (ground_truth_phi < 2.0) & (ground_truth_psi > -2) & (ground_truth_psi < 2)
-        )
-        if is_low_probability.any():
-            log.info("Found low probability state. Prepending it to the simulation...")
-            first_low_probability_state = data[is_low_probability][0]
-            initial_positions = jnp.concatenate([first_low_probability_state[None], initial_positions[:-1]], axis=0)
+        def replay():
+            nonlocal x, v
+            noise = torch.randn(x.shape, device=device, generator=generator)
+            x, v = step(x, v, noise)
+            return x, v
+    if profile_steps:
+        for _ in range(5):
+            replay()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        start = time.monotonic()
+        for _ in range(profile_steps):
+            replay()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        seconds = time.monotonic() - start
+        profile = {"steps": profile_steps, "seconds": seconds, "paths": len(x), "compile": compiled,
+                   "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache,
+                   "steps_per_second": profile_steps / seconds,
+                   "full_simulation_hours": settings["simulation_steps"] * seconds / profile_steps / 3600}
+        write_json(profile, directory / "profile.json")
+        print(json.dumps(profile, indent=2), flush=True)
+        return
+    write_json(identity, metadata)
+    arrays = [np.lib.format.open_memmap(directory / f"{sequence}_simulation.npy", mode="r+" if state else "w+",
+                                      dtype="float32", shape=(settings["replicas"], nframes, 30))
+              for sequence in settings["peptides"]]
+    chunk = settings["chunk_frames"]
+    start = time.monotonic()
+    while completed < settings["simulation_steps"]:
+        begin_frame = completed // settings["save_every"]
+        frames = min(chunk, nframes - begin_frame)
+        positions = torch.empty((len(x), frames, 30), dtype=x.dtype, device=device)
+        for frame in range(frames):
+            for _ in range(settings["save_every"]):
+                x, v = replay()
+            positions[:, frame].copy_(x)
+            if frame % max(1, 1000 // settings["save_every"]) == 0:
+                print(f"Simulation {model.method}: step {completed + (frame + 1) * settings['save_every']}/"
+                      f"{settings['simulation_steps']}", flush=True)
+        cpu_positions = positions.cpu().numpy()
+        alive &= np.isfinite(cpu_positions).all(axis=(1, 2))
+        alive &= torch.isfinite(v).all(dim=1).cpu().numpy()
+        for i, array in enumerate(arrays):
+            array[:, begin_frame:begin_frame + frames] = cpu_positions[i * settings["replicas"]:(i + 1) * settings["replicas"]]
+            array.flush()
+        completed += frames * settings["save_every"]
+        atomic_save({"completed": completed, "x": x.cpu(), "v": v.cpu(), "alive": alive,
+                     "rng": generator.get_state(), "identity": identity}, state_path)
+        elapsed = time.monotonic() - start
+        print(f"Saved {model.method}: {completed}/{settings['simulation_steps']}, "
+              f"alive {alive.sum()}/{len(alive)}, {elapsed / 60:.1f} min this session", flush=True)
+    write_json({"complete": True, "steps_per_path": completed, "replicas": settings["replicas"],
+                "aggregate_ns_per_peptide": completed * settings["dt"] * settings["replicas"] / 1000,
+                "alive_paths": alive.tolist()}, directory / "simulation_complete.json")
+
+
+def plot_results(truth, iid, simulation, sequence, directory, settings):
+    kbt = settings["temperature"] * R_GAS
+    datasets = {"Reference": truth, "Independent": iid, "Simulation": simulation}
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    for ax, (label, sample) in zip(axes, datasets.items()):
+        counts = np.histogram2d(*sample.T, bins=settings["plot_bins"], range=[[-np.pi, np.pi]] * 2)[0]
+        pmf = -np.log(counts / max(1, counts.sum()) + 1e-6)
+        pmf -= pmf.min()
+        image = ax.imshow(pmf.T, extent=(-np.pi, np.pi, -np.pi, np.pi), origin="lower", vmin=0, vmax=12,
+                          aspect="equal", cmap="magma_r")
+        ax.set(xlabel=r"$\varphi$", ylabel=r"$\psi$", title=f"{sequence}: {label}")
+    fig.colorbar(image, ax=list(axes), label=r"PMF / $k_BT$")
+    fig.savefig(directory / f"{sequence}_pmf_2d.png", dpi=150)
+    plt.close(fig)
+    grid = np.linspace(-np.pi, np.pi, 100)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    for dim, ax in enumerate(axes):
+        for label, sample in datasets.items():
+            # Preserve source plot_fes_angles: concatenate periodic images, then
+            # plot_fes filters to [-pi, pi] before fitting the KDE.
+            extended = np.concatenate([sample[:, dim], sample[:, dim] + 2 * np.pi, sample[:, dim] - 2 * np.pi])
+            extended = extended[(extended >= grid.min()) & (extended <= grid.max())]
+            if len(extended) < 2 or np.std(extended) < 1e-12:
+                continue
+            fes = -kbt * gaussian_kde(extended, bw_method=settings["kde_bw"]).logpdf(grid)
+            fes -= fes.min()
+            ax.plot(grid, fes, label=label)
+        ax.set(xlabel=(r"$\varphi$", r"$\psi$")[dim], ylabel="PMF (kJ/mol)", title=sequence, xlim=(-np.pi, np.pi))
+        ax.legend()
+    fig.savefig(directory / f"{sequence}_pmf_1d.png", dpi=150)
+    plt.close(fig)
+
+
+def evaluate_outputs(config, split, method, directory, iid_directory):
+    settings = config["evaluation"]
+    state_path = directory / "simulation_state.pt"
+    if not state_path.exists():
+        raise FileNotFoundError(f"Missing completed simulation: {state_path}")
+    state = torch.load(state_path, weights_only=False)
+    if any(state["identity"].get(key) != settings[key] for key in PROTOCOL_KEYS):
+        raise ValueError(f"Configured simulation protocol differs from saved state: {state_path}")
+    if state["identity"]["method"] != method:
+        raise ValueError(f"Saved simulation method differs from {method}: {state_path}")
+    if state["completed"] != settings["simulation_steps"]:
+        raise ValueError(f"Incomplete simulation at {state['completed']} steps in {directory}")
+    rows = []
+    for i, sequence in enumerate(settings["peptides"]):
+        iid_state = torch.load(iid_directory / f"{sequence}_iid_state.pt", weights_only=False)
+        expected_iid = {"samples": settings["num_iid_samples"], "steps": settings["diffusion_steps"], "seed": settings["seed"]}
+        if any(iid_state["identity"].get(key) != value for key, value in expected_iid.items()):
+            raise ValueError(f"Configured IID protocol differs from saved {sequence} samples")
+        if iid_state["identity"]["checkpoint"] != state["identity"]["checkpoint"]:
+            raise ValueError(f"Independent and simulation samples use different checkpoints for {sequence}")
+        if iid_state["completed"] != settings["num_iid_samples"]:
+            raise ValueError(f"Incomplete IID samples for {sequence}")
+        truth = angles(split[sequence]["x"])
+        iid = angles(np.load(iid_directory / f"{sequence}_iid.npy", mmap_mode="r"))
+        trajectories = np.load(directory / f"{sequence}_simulation.npy", mmap_mode="r")
+        alive = state["alive"][i * settings["replicas"]:(i + 1) * settings["replicas"]]
+        simulation = np.asarray(trajectories[alive]).reshape(-1, 30)
+        if len(simulation):
+            indices = np.random.default_rng(settings["seed"]).permutation(len(simulation))[:settings["num_iid_samples"]]
+            simulation = angles(simulation[indices])
         else:
-            log.warning("No low probability state found. Using random starting points...")
-
-    trajectories, velocities = molecules.simulate_molecule(
-        dataset,
-        force,
-        initial_positions,
-        None,
-        n_samples,
-        n_steps,
-        langevin_dt,
-        seed,
-    )
-
-    return molecules.evaluate_langevin_samples(
-        dataset,
-        dataset.train.data,
-        trajectories,
-        velocities,
-        max_num_openmm_evaluations,
-        dataset.write_animation if hasattr(dataset, "write_animation") else None,
-        wandb,
-        prefix,
-        out_dir,
-        only_store_results=only_store_results,
-    )
+            simulation = np.empty((0, 2))
+        row = {"method": method, "peptide": sequence, "reference_samples": len(truth),
+               "iid_valid_samples": int(np.isfinite(iid).all(axis=1).sum()),
+               "simulation_valid_samples": int(np.isfinite(simulation).all(axis=1).sum()),
+               "simulation_alive_paths": int(alive.sum()), "simulation_total_paths": settings["replicas"]}
+        for source, sample in (("iid", iid), ("simulation", simulation)):
+            row.update({f"{source}_{key}": value for key, value in metrics(truth, sample, settings["bins"]).items()})
+        rows.append(row)
+        np.savez(directory / f"{sequence}_angles.npz", reference=truth, iid=iid, simulation=simulation)
+        plot_results(truth[np.isfinite(truth).all(1)], iid[np.isfinite(iid).all(1)],
+                     simulation[np.isfinite(simulation).all(1)], sequence, directory, settings)
+    frame = pd.DataFrame(rows)
+    frame.to_csv(directory / "metrics.csv", index=False)
+    write_json(rows, directory / "metrics.json")
+    write_json(metrics_identity(settings), directory / "metrics_metadata.json")
+    return frame
 
 
-def simulate_minipeptide(
-    datapoints: Datapoints,
-    limit_inference_peptides: Optional[Sequence[str]],
-    dataset: CGMinipeptideDataset,
-    force: Callable[[jnp.ndarray], jnp.ndarray],
-    n_points: int,
-    n_samples: int,
-    n_steps: int,
-    langevin_dt: Optional[float],
-    wandb: bool,
-    out_dir: str,
-    seed: int,
-    only_store_results: bool = False,
-) -> dict:
-    os.makedirs(out_dir, exist_ok=True)
-
-    initial_positions = []
-    features = []
-
-    current_idx = 0
-    for peptide, peptide_length in zip(datapoints.peptides, datapoints.peptide_lengths):
-        next_idx = current_idx + peptide_length
-
-        if limit_inference_peptides is not None and peptide not in limit_inference_peptides:
-            log.info(f"Skipping peptide {peptide}")
-        else:
-            if peptide_length < n_points:
-                raise ValueError(f"Peptide {peptide} has only {peptide_length} points, but {n_points} are required")
-
-            random_samples = jax.random.permutation(jax.random.PRNGKey(seed), peptide_length)[:n_points]
-            initial_positions.append(datapoints.data[current_idx:next_idx][random_samples])
-            features.append(datapoints.features[current_idx:next_idx][random_samples])
-
-        current_idx = next_idx
-
-    if len(initial_positions) == 0:
-        log.warning("No peptides found to evaluate")
-        return {}
-
-    initial_positions = jnp.concatenate(initial_positions)
-    features = jnp.concatenate(features)
-
-    trajectories, velocities = molecules.simulate_molecule(
-        dataset, force, initial_positions, features, n_samples, n_steps, langevin_dt, seed
-    )
-
-    metrics = {}
-    current_idx = 0
-    i = 0
-    for peptide, peptide_length in zip(datapoints.peptides, datapoints.peptide_lengths):
-        next_idx = current_idx + peptide_length
-        if limit_inference_peptides is not None and peptide not in limit_inference_peptides:
-            log.info(f"Skipping peptide {peptide}")
-        else:
-            current_trajectories = trajectories[i * n_points : (i + 1) * n_points]
-            current_velocities = velocities[i * n_points : (i + 1) * n_points]
-
-            baseline_samples = datapoints.data[current_idx:next_idx]
-
-            metrics |= molecules.evaluate_langevin_samples(
-                dataset,
-                baseline_samples,
-                current_trajectories,
-                current_velocities,
-                None,
-                lambda x, out_dir: dataset.write_animation(x, peptide, out_dir),
-                wandb,
-                peptide,
-                out_dir,
-                only_store_results=only_store_results,
-            )
-            i += 1
-
-        current_idx = next_idx
-    return metrics
+def metrics_identity(settings):
+    return {key: settings[key] for key in PROTOCOL_KEYS + ("num_iid_samples", "diffusion_steps", "bins")}
 
 
-def evaluate_molecule_samples(
-    dataset: ALDPDataset | CGMinipeptideDataset | SingleProteinDataset,
-    ground_truth_samples: jnp.ndarray,
-    reference_sample: jnp.ndarray,
-    features: Optional[jnp.ndarray],
-    unnormalized_score: Callable,
-    norm_factor: jnp.ndarray,
-    inference_bs: int,
-    num_samples: int,
-    write_animation: Optional[Callable[[jnp.ndarray, str], None]],
-    wandb: bool,
-    prefix: str,
-    out_dir: str,
-    seed: int,
-    only_store_results: bool = False,
-) -> dict:
-    if not only_store_results:
-        plt.figure(clear=True)
-        dataset.plot_2d(ground_truth_samples, title=f"Histogram {prefix} (ground truth)")
-        plt.savefig(f"{out_dir}/{prefix}_iid_phi_psi_target.png", bbox_inches="tight")
-        plt.close()
-
-    sample_shape = (num_samples, dataset.train.data.shape[1])
-    q_samples = get_samples(
-        sample_shape,
-        features,
-        unnormalized_score,
-        norm_factor=norm_factor,
-        BS=inference_bs,
-        seed=seed,
-    ).reshape(-1, *dataset.sample_shape)
-    q_samples, _ = kabsch_align_many(q_samples, reference_sample)
-    onp.save(f"{out_dir}/{prefix}_iid_samples.npy", q_samples)
-    log.info(f"Saved iid samples to {out_dir}/{prefix}_iid_samples.npy")
-
-    if only_store_results:
-        return {}
-
-    return molecules.evaluate_iid_samples(
-        dataset, ground_truth_samples, q_samples, write_animation, wandb, prefix, out_dir
-    )
+def write_summary(result_root, frames, settings):
+    combined = pd.concat(frames, ignore_index=True)
+    combined.to_csv(result_root / "per_peptide.csv", index=False)
+    summary, comparison = {}, []
+    metric_names = [c for c in combined.columns if c.startswith(("iid_", "simulation_"))
+                    and not c.endswith(("samples", "paths"))]
+    for method, group in combined.groupby("method", sort=False):
+        summary[method] = {}
+        for name in metric_names:
+            values = group[name].dropna()
+            mean, std = (float(values.mean()), float(values.std(ddof=0))) if len(values) else (None, None)
+            summary[method][name] = {"mean": mean, "std_across_peptides": std,
+                                   "evaluated_peptides": len(values), "expected_peptides": len(settings["peptides"])}
+        for index, name in enumerate(PAPER_METRICS):
+            result = summary[method][name]
+            for definition in ("paper", "released_code"):
+                current = name if definition == "paper" else name.replace("_jsd", "_code_jsd").replace("_pmf", "_code_pmf")
+                measured = summary[method][current]
+                comparison.append({"method": method, "metric_definition": definition, "metric": name,
+                                   "mean": measured["mean"], "std": measured["std_across_peptides"],
+                                   "paper_mean": PAPER[method][0][index], "paper_std": PAPER[method][1][index],
+                                   "gap": None if measured["mean"] is None else measured["mean"] - PAPER[method][0][index],
+                                   "evaluated_peptides": measured["evaluated_peptides"]})
+    report = {"source": "https://arxiv.org/pdf/2506.17139v3", "methods": summary,
+              "settings": settings, "comparison": comparison,
+              "notes": ["The scalar Fokker–Planck coefficient is 0.0005 from the paper; released YAML uses 0.005.",
+                        "Paper and released-code metric definitions differ; both are reported on identical samples.",
+                        "Standard deviations are across peptides, not independent training seeds.",
+                        "Nonfinite simulation paths are excluded as in released code; counts are reported explicitly.",
+                        "Two-for-One shares diffusion weights and independent samples."]}
+    write_json(report, result_root / "summary.json")
+    pd.DataFrame(comparison).to_csv(result_root / "comparison.csv", index=False)
+    print(pd.DataFrame(comparison).to_string(index=False), flush=True)
 
 
-def evaluate_forces_aldp(
-    dataset: ALDPDataset,
-    force: Callable[[jnp.ndarray], jnp.ndarray],
-    BS: int,
-    wandb: bool,
-    out_dir: str,
-) -> dict:
-    # This is a bit hacky
-    xyz = jnp.array(dataset._dataset.xyz)[:, dataset._atoms_to_keep, ...]
-    ground_truth_forces = jnp.array(dataset._dataset.forces)[:, dataset._atoms_to_keep, ...]
-    ground_truth_forces = jnp.linalg.norm(ground_truth_forces, axis=(1, 2))
-    assert dataset.train.features is None
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/dipeptides.yaml")
+    parser.add_argument("--method", choices=("all",) + METHODS, default="all")
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--compile", action="store_true", help="Compile static expert score functions; validates against eager")
+    parser.add_argument("--inference-cache", action="store_true", help="Compose frozen adjacent edge projections; validates score equivalence")
+    parser.add_argument("--cuda-graphs", action="store_true", help="Capture simulation arithmetic; validates one-step equivalence")
+    parser.add_argument("--profile-only", action="store_true")
+    parser.add_argument("--profile-steps", type=int, default=100)
+    parser.add_argument("--metrics-only", action="store_true")
+    parser.add_argument("--iid-samples", type=int)
+    parser.add_argument("--simulation-steps", type=int)
+    parser.add_argument("--replicas", type=int)
+    parser.add_argument("--inference-batch", type=int)
+    parser.add_argument("--output", help="Override result root")
+    args = parser.parse_args()
+    if args.checkpoint and args.method == "all":
+        parser.error("--checkpoint requires a single --method")
+    if args.metrics_only and args.profile_only:
+        parser.error("--metrics-only and --profile-only are mutually exclusive")
+    config = load_config(args.config)
+    settings = config["evaluation"]
+    configured_methods = tuple(settings.get("methods", METHODS))
+    if not configured_methods or len(set(configured_methods)) != len(configured_methods) or set(configured_methods) - set(METHODS):
+        parser.error("evaluation.methods must contain unique supported method names")
+    overrides = {"num_iid_samples": args.iid_samples, "simulation_steps": args.simulation_steps, "replicas": args.replicas}
+    smoke = any(value is not None and value != settings[key] for key, value in overrides.items())
+    settings.update({key: value for key, value in overrides.items() if value is not None})
+    if args.inference_batch is not None:
+        settings["inference_batch"] = args.inference_batch
+    if min(settings["num_iid_samples"], settings["replicas"], settings["inference_batch"]) < 1:
+        parser.error("sample counts, replicas and batch size must be positive")
+    if settings["diffusion_steps"] < 2 or settings["simulation_steps"] < settings["save_every"]:
+        parser.error("at least two diffusion steps and one saved simulation frame are required")
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    torch.manual_seed(settings["seed"])
+    root = Path(config["data"].get("root", "data")) / "results"
+    if smoke:
+        tag = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()[:10]
+        root = root / f"smoke_{tag}"
+    result_root = Path(args.output) if args.output else root
+    result_root.mkdir(parents=True, exist_ok=True)
+    split = load_split(config, "test")
+    missing = set(settings["peptides"]) - set(split)
+    if missing:
+        raise ValueError(f"Missing evaluation peptides from test split: {sorted(missing)}")
+    methods = configured_methods if args.method == "all" else (args.method,)
+    frames = []
+    for method in methods:
+        directory = result_root / method
+        directory.mkdir(parents=True, exist_ok=True)
+        iid_directory = result_root / ("diffusion" if method == "two_for_one" else method)
+        if not args.metrics_only:
+            model, norm, checkpoint, digest = load_model(config, method, device, args.checkpoint)
+            # Keep the same weights while distinguishing Two-for-One's simulation time.
+            model.method = method
+            print(f"Evaluating {method}: {checkpoint} on {device}", flush=True)
+            if args.inference_cache:
+                cache_inference_checked(model, split, config, norm, device)
+            if not args.profile_only:
+                generate_iid(config, split, model, norm, digest, iid_directory, device, args.compile)
+            simulate(config, split, model, norm, digest, directory, device, args.compile,
+                     args.cuda_graphs, args.profile_steps if args.profile_only else 0)
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if not args.profile_only:
+            frames.append(evaluate_outputs(config, split, method, directory, iid_directory))
+    if frames:
+        # Include other already completed methods when an individual method finishes.
+        by_method = {frame.iloc[0]["method"]: frame for frame in frames}
+        for method in configured_methods:
+            existing = result_root / method / "metrics.csv"
+            if method not in by_method and existing.exists():
+                metadata = existing.with_name("metrics_metadata.json")
+                if not metadata.exists() or json.loads(metadata.read_text()) != metrics_identity(settings):
+                    raise ValueError(f"Incompatible saved metrics: {existing}. Recompute with --method all --metrics-only")
+                frame = pd.read_csv(existing)
+                if set(frame.peptide) != set(settings["peptides"]) or frame.peptide.duplicated().any():
+                    raise ValueError(f"Saved metrics have an incompatible peptide list: {existing}")
+                by_method[method] = frame
+        write_summary(result_root, list(by_method.values()), settings)
 
-    # iterata data with BS
-    @jax.jit
-    def adjusted_force(x):
-        return force(x.reshape(x.shape[0], -1), None).reshape(x.shape[0], *dataset.sample_shape)
 
-    forces = []
-    for i in trange(0, xyz.shape[0], BS, desc="Computing forces"):
-        trajectory = xyz[i : min(i + BS, xyz.shape[0])]
-        forces.append(adjusted_force(trajectory))
-
-    forces = jnp.concatenate(forces)  # shape: (n_samples, *sample_shape)
-    forces = jnp.linalg.norm(forces, axis=(1, 2))
-
-    plt.figure(clear=True)
-    plt.title("Predicted forces")
-    plt.hist(ground_truth_forces, bins=100, alpha=0.7, label="Ground Truth", density=True)
-    plt.hist(forces, bins=100, alpha=0.7, label="Model", density=True)
-    plt.xlabel("Force Norm")
-    plt.ylabel("Density")
-    plt.legend()
-    plt.savefig(f"{out_dir}/forces_histogram.png", bbox_inches="tight")
-    plt.close()
-
-    plt.figure(clear=True)
-    plt.title("Relative force error")
-    plt.hist(ground_truth_forces / forces, bins=100, density=True)
-    plt.axvline(jnp.mean(ground_truth_forces / forces), color="k", linestyle="dashed", linewidth=1)
-    plt.xlabel("Relative Force Error")
-    plt.ylabel("Density")
-    plt.savefig(f"{out_dir}/forces_error_histogram.png", bbox_inches="tight")
-    plt.close()
-
-    if wandb:
-        wandb_lib.log({"eval/forces_histogram": wandb_lib.Image(f"{out_dir}/forces_histogram.png")})
-        wandb_lib.log({"eval/forces_error_histogram:": wandb_lib.Image(f"{out_dir}/forces_error_histogram.png")})
-        wandb_lib.log(
-            {
-                "eval/mean_abs_force_error": jnp.mean(jnp.abs(ground_truth_forces - forces)),
-                "eval/mean_relative_force_error": jnp.mean(ground_truth_forces / forces),
-            }
-        )
-
-    return {}
+if __name__ == "__main__":
+    main()

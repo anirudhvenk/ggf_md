@@ -1,3 +1,0 @@
-transformer_potential:
-  _target_: scoremd.models.GraphTransformerModelInfo
-  dropout: 0.0

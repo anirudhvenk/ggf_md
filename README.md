@@ -1,128 +1,178 @@
-<h1 align="center">Consistent Sampling and Simulation: Molecular Dynamics with Energy-Based Diffusion Models</h1>
-<p align="center">
-<a href="https://arxiv.org/abs/2506.17139"><img src="https://img.shields.io/badge/arXiv-b31b1b?style=for-the-badge&logo=arxiv" alt="arXiv"/></a>
-<a href="https://papers.nips.cc/paper_files/paper/2025/hash/231be94eaf8dcbc49a95b256c9b6b8b5-Abstract-Conference.html"><img src="https://img.shields.io/badge/NeurIPS-4f2d4e?style=for-the-badge" alt="NeurIPS"/></a>
-<a href="https://colab.research.google.com/drive/1r3DGOpGZgIbx7p_uWbsm0b6iP-kiyU_v"><img src="https://img.shields.io/badge/Colab jax-e37e3d.svg?style=for-the-badge&logo=googlecolab&logoColor=white" alt="JAX Colab"/></a>
-<a href="https://colab.research.google.com/drive/1rbcNDwDduPw5QMulbOC-Pg6xGd4wGjej"><img src="https://img.shields.io/badge/Colab PyTorch-e37e3d.svg?style=for-the-badge&logo=googlecolab&logoColor=white" alt="Colab PyTorch"/></a>
-</p>
+# Transferable dipeptides in PyTorch
 
-<p align="center">
-  <img src="images/anim.gif" style="width: 100%; height: auto; max-width: 100%;"/>
-</p>
+Minimal reproduction of the dipeptide generalization experiment in
+[Consistent Sampling and Simulation](https://arxiv.org/pdf/2506.17139v3).
+Original implementation: [ScoreMD](https://github.com/noegroup/ScoreMD), revision
+`149b1ec54d60068c421cee6bce77ecac5cb2a9ef` of this repository.
 
-<p align="center">
-  <em>Animation showing the two modes of our model: independent sampling by diffusion denoising (left) and molecular dynamics simulation (right).</em>
-</p>
+The code is three files: `model.py` (graph transformer and expert routing),
+`train.py` (data preparation and training), and `evaluate.py` (sampling,
+simulation, metrics, and plots). Configuration lives in `configs/`; all downloaded
+data and generated artifacts live in `data/`. Models and automatic differentiation
+use PyTorch only.
 
-## Overview
+## Handoff to another server
 
-This repository contains the complete codebase for training and evaluating energy-based diffusion models for molecular dynamics simulations. Our approach enables a single model to perform both independent sampling via diffusion denoising and continuous molecular dynamics simulations through a Fokker-Planck-based regularization scheme.
+**No production training has been launched.** All three training methods are
+enabled. The prepared bundle is `data/ggf_md_handoff.tar.gz`; it includes the code,
+environment recipe, configuration, validation reports, and the 1.9 GiB processed
+dataset. It omits the original download volumes and raw files because training
+and evaluation can use the processed cache directly.
 
-## Method
-
-<p align="center">
-<img src="images/main.png" alt="Visualization of the main idea of this paper."/>
-</p>
-
-<p align="center">
-  <em>We introduce a Fokker-Planck-based regularization to train an energy-based diffusion model with stable, self-consistent scores near the data distribution. This regularization ensures that the learned score function corresponds to a consistent energy function, enabling the model to perform both generative sampling and accurate energy-estimation.</em>
-</p>
-
-## Tutorial
-
-We provide minimal working implementations in Jupyter notebooks:
-- **[JAX version](https://colab.research.google.com/drive/1r3DGOpGZgIbx7p_uWbsm0b6iP-kiyU_v)** (recommended) - Faster and closer to this repository's implementation
-- **[PyTorch version](https://colab.research.google.com/drive/1rbcNDwDduPw5QMulbOC-Pg6xGd4wGjej)** - Alternative implementation
-
-Both notebooks demonstrate how to reproduce similar figures to the one shown above and perform molecular dynamics simulations with a diffusion model on the Müller-Brown potential. 
-
-# 🚀 Getting Started
-
-## Installation
-
-### pixi
-All dependencies are managed with [pixi](https://github.com/prefix-dev/pixi), which ensures fully reproducible environments across different systems.
-
-To set up the environment, run:
+Copy the bundle, replacing `USER@SERVER` with your destination:
 
 ```bash
-pixi install --frozen
+scp /home/anirudh/ggf_md/data/ggf_md_handoff.tar.gz{,.sha256} USER@SERVER:~/
 ```
 
-
-To activate the environment, run:
-```bash
-pixi shell
-```
-
-### Docker
-If you are on an amd64 system (e.g. a Linux machine), you can use the docker image to run the code. To build the docker image, run:
+On that server:
 
 ```bash
-docker build -t scoremd .
+cd ~
+sha256sum -c ggf_md_handoff.tar.gz.sha256
+tar -xzf ggf_md_handoff.tar.gz
+cd ~/ggf_md
+conda env create -f environment.yml
+conda activate ggf_md
+python train.py --prepare-data  # validates the included cache; no download needed
 ```
 
-To run the docker container, run:
+When ready, these commands launch the three independent jobs on GPUs 0, 1, and 2:
 
 ```bash
-docker run -it --rm -v $(pwd)/outputs:/workspace/outputs -v $(pwd)/storage:/workspace/storage -v $(pwd)/multirun:/workspace/multirun scoremd python train.py ...
+CUDA_VISIBLE_DEVICES=0 nohup python -u train.py --method diffusion --device cuda:0 --compile --microbatch 1024 > data/diffusion.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python -u train.py --method mixture --device cuda:0 --compile --microbatch 1024 > data/mixture.log 2>&1 &
+CUDA_VISIBLE_DEVICES=2 nohup python -u train.py --method fokker_planck --device cuda:0 --compile --microbatch 512 > data/fokker_planck.log 2>&1 &
 ```
 
-### Alternative Installation Methods
+Choose available GPUs and reduce `--microbatch` if memory is limited. The effective
+batch remains 1024. The Conda recipe includes a C++ compiler for compilation;
+omit `--compile` to use eager execution. The first compiled step includes compilation time.
+To estimate runtime before committing to a full run, use the corresponding
+training command with `--profile-only` in the foreground. It measures three
+optimizer steps without saving a production checkpoint.
 
-If you prefer using your own dependency manager (e.g., conda, pip), you can install the dependencies listed in `pyproject.toml` with your preferred tool.
-
-
-## Quick Start: Toy Systems
-
-We use [Hydra](https://hydra.cc/) for configuration management. You can override any configuration via command-line arguments or configuration files.
-
-Train on example toy systems using the provided configurations:
+Checkpoints are under `data/runs/METHOD/seed1/`. To resume Diffusion, for example:
 
 ```bash
-python train.py dataset=double_well +architecture=mlp/small_potential
-python train.py dataset=double_well_2d +architecture=mlp/small_potential
+python train.py --method diffusion --device cuda:0 --compile --microbatch 1024 --resume data/runs/diffusion/seed1/latest.pt
 ```
 
-Outputs will be saved to the `outputs/` directory.
+After all three final checkpoints exist:
 
-# 🧬 Working with Molecules
-> [!IMPORTANT]
-> This repository does **not** contain all datasets directly.
-> Training data for the toy systems and alanine dipeptide will be downloaded automatically. 
-> For the dipeptides, you can download the dataset from [this release](https://github.com/noegroup/ScoreMD/releases/tag/1.0.0) and place it into the `./storage` directory (one subfolder for each dataset, e.g. `./storage/minipeptides/`, `./storage/deshaw/`).
-> Data for the fast-folder systems can be requested from D. E. Shaw Research, as described in the [original paper](https://www.science.org/doi/full/10.1126/science.1208351).
-> If you do not have access to the fast-folder data, [this release](https://github.com/noegroup/ScoreMD/releases/tag/1.0.0) also provides dummy data generated by our models, which is sufficient for inference.
-
-## Running Inference with Pre-Trained Models
-
-We provide pre-trained model weights for all models presented in the paper. For detailed instructions on downloading and using these models, please refer to [INFERENCE.md](INFERENCE.md).
-
-## Training Models from the Paper
-
-To reproduce the results from our paper, see [TRAIN.md](TRAIN.md) for the exact training commands used for each model and dataset. 
-
-## Evaluation and Plotting Scripts
-
-For implementation details and benchmarking against your own methods, we provide evaluation scripts in the [evaluation](evaluation/README.md) directory.
-
-# Contributing
-
-Feel free to open an issue if you encounter any problems or have questions.
-
-# Citation
-
-If you find our work useful, please cite:
-
+```bash
+python evaluate.py --method all --device cuda:0 --compile --cuda-graphs --inference-cache
 ```
-@inproceedings{plainer2025consistent,
-  author = {Plainer, Michael and Wu, Hao and Klein, Leon and G{\"u}nnemann, Stephan and No{\'e}, Frank},
-  title = {Consistent Sampling and Simulation: Molecular Dynamics with Energy-Based Diffusion Models},
-  booktitle = {Advances in Neural Information Processing Systems},
-  editor = {Belgrave, D. and Zhang, C. and Lin, H. and Pascanu, R. and Koniusz, P. and Ghassemi, M. and Chen, N.},
-  pages = {24460--24505},
-  publisher = {Curran Associates, Inc.},
-  volume = {38},
-  year = {2025},
-}
+
+The validated inference cache combines adjacent frozen linear projections.
+It retains the same weights and mathematical function, with small float32
+rounding differences; omit its flag to use the original operation ordering.
+Evaluation includes Diffusion, Two-for-One, Mixture, and Fokker–Planck.
+
+## Environment
+
+Install [Miniforge](https://conda-forge.org/download/) if Conda is unavailable, then:
+
+```bash
+conda env create -f environment.yml
+conda activate ggf_md
+python -c 'import torch; print(torch.__version__, torch.cuda.device_count())'
 ```
+
+No Docker, local CUDA toolkit, JAX, experiment tracking account, or package
+installation of this repo is needed. On this account Miniforge is installed at
+`~/.local/miniforge3`; activate its shell support with
+`source ~/.local/miniforge3/etc/profile.d/conda.sh`.
+
+## Data and training
+
+```bash
+python train.py --prepare-data
+python train.py --method diffusion --device cuda:0 --compile --microbatch 1024
+python train.py --method mixture --device cuda:1 --compile --microbatch 1024
+python train.py --method fokker_planck --device cuda:2 --compile --microbatch 512
+```
+
+Data preparation downloads the seven split archive parts from the
+[official release](https://github.com/noegroup/ScoreMD/releases/tag/1.0.0), verifies
+them, extracts the split archive with the environment's `7zip` utility, and prepares
+the original sequence splits. Downloads total approximately 7.3 GB; allow additional
+space for extraction, processed data, checkpoints, and trajectories.
+
+The experiment excludes glycine-containing sequences, retains atoms
+`N, CA, CB, C, O` for each residue, and preserves first-frame Kabsch alignment and
+training-only scalar normalization. Coordinates are in nm. The split contains
+175 training, 75 validation, and 92 test peptides. Evaluation uses the paper's
+15 held-out peptides: AC, AP, AT, ET, HP, HT, IM, KQ, KS, LW, NF, NY, RL, RV, TD.
+
+Use `--microbatch N` to control memory use without changing the effective batch
+size of 1024. The three methods train independently and can use separate GPUs.
+Checkpoints include optimizer and RNG state; resume with `--resume PATH`.
+Use `--profile-only` before a long run to measure actual throughput on shared GPUs.
+The configuration defaults to one full run with seed 1: 120 epochs for Diffusion
+and Fokker–Planck, and 10/20/100 epochs for the high/middle/low-time Mixture experts.
+
+## Evaluation
+
+```bash
+python evaluate.py --method all --device cuda:2
+```
+
+Two-for-One shares Diffusion weights and independent samples, and changes the
+simulation diffusion time from `1e-5` to `0.02`. Independent sampling uses the
+original 1,000-step reverse VP Euler–Maruyama calculation and 49,000 samples per
+peptide. Each simulation uses ten replicas of six million steps at 0.5 fs,
+giving 30 ns aggregate time per peptide. Every 50th frame is stored; 49,000
+frames are selected for comparison. Simulation progress is resumable.
+
+Results include per-peptide values, means and population standard deviations
+across the 15 peptides, published reference values, and PMF plots for independent
+generation and simulation. KS is the paper's principal example. Short evaluation
+overrides are for smoke checks; they must not be reported as the full reproduction.
+
+## Fidelity choices
+
+The graph transformer, source time features, mixture boundaries, finite-difference
+loss, optimizer settings, and numerical samplers are preserved. Attention uses
+eight heads of dimension 64. The conservative transformer has 1,398,497
+parameters; the mixture has 2,763,997. The source EMA update is
+`ema = 0.995 * new_parameters + 0.005 * ema`, with parameters replaced by EMA at
+each epoch end; this convention is preserved.
+
+The scalar FP coefficient is **0.0005**, following the paper's Table 6. Both the
+released checkpoint and training instructions instead use **0.005**. The source's
+FP residual constant, dimension normalization, DSM weighting, and asymmetric time
+finite differences remain unchanged. The source scalar coefficient is named
+`beta`; its separate vector penalty remains zero. These choices reproduce the
+agreed experiment and are recorded rather than treated as equivalent formulas.
+
+Two metric definitions are reported on the same samples:
+
+- **Paper interpretation (primary):** fixed 64×64 bins on `[-pi, pi]^2`, add-one
+  count smoothing for natural-log JSD, and uniform average squared log-proportion
+  error with baseline `1e-6` for PMF. The square root of JSD is also reported as
+  JS distance because the prose uses both terms.
+- **Released evaluator (comparison):** unsmoothed natural-log JSD with bin edges
+  from the combined observed range, and probability-weighted PMF error using the
+  original outlier-bin and missing-bin conventions.
+
+The published values correspond to the original evaluation implementation;
+comparison metrics help distinguish metric-definition changes from model error.
+The physical Langevin noise uses the source/OpenMM variance `kBT*(1-a*a)/mass`,
+where `a=exp(-gamma*dt)`; the squared `(1-a)` printed in paper Equation 33 is
+inconsistent with that integrator. No force clipping or extra burn-in is added.
+Hyperparameters are not selected against test-set results.
+
+| Method | IID JSD | Simulation JSD | IID PMF | Simulation PMF |
+|---|---:|---:|---:|---:|
+| Diffusion | 0.0155 | 0.2256 | 0.206 | 6.515 |
+| Two-for-One | 0.0153 | 0.0466 | 0.203 | 0.741 |
+| Mixture | 0.0155 | 0.0444 | 0.200 | 0.658 |
+| Fokker–Planck | 0.0200 | 0.0254 | 0.241 | 0.368 |
+
+Reference means: paper Appendix C.8.1, PDF Table 17. Published standard deviations
+are across peptides, not training seeds. Shared IID samples make Diffusion and
+Two-for-One results identical here; their published difference reflects sampling.
+
+Code retains the original MIT license and attribution. Dataset provenance and
+licenses are described in the paper and official release.

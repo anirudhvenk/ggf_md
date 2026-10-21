@@ -1,8 +1,0 @@
-mlp_potential:
-  _target_: scoremd.models.MLPModelInfo
-  hidden_dims:
-  - 512
-  - 512
-  - 512
-  activation: swish
-  potential: true

@@ -1,0 +1,48 @@
+# Source calculations retained; scalar FP weight follows paper Table 6.
+data:
+  root: data
+  release: https://github.com/noegroup/ScoreMD/releases/download/1.0.0
+model:
+  hidden_dim: 128
+  layers: 3
+  score_hidden_dim: 96
+  score_layers: 2
+  embedding_dim: 16
+  heads: 8
+  head_dim: 64
+training:
+  methods: [diffusion, mixture, fokker_planck]
+  seed: 1
+  batch_size: 1024
+  epochs: 120
+  mixture_epochs: [10, 20, 100]
+  learning_rate: 0.0003
+  min_learning_rate: 0.00001
+  weight_decay: 0.0001
+  clip: 1000.0
+  ema_weight: 0.995
+  fp_weight: 0.0005
+  time_midpoint: 0.3
+  mixture_midpoints: [0.8, 0.35, 0.03]
+  sigma: 0.0001
+  fd_hs: 0.001
+  fd_hd: 0.0005
+evaluation:
+  methods: [diffusion, two_for_one, mixture, fokker_planck]
+  seed: 0
+  peptides: [KS, AT, LW, KQ, NY, IM, TD, HT, NF, RL, ET, AC, RV, HP, AP]
+  num_iid_samples: 49000
+  diffusion_steps: 1000
+  simulation_steps: 6000000
+  save_every: 50
+  replicas: 10
+  eval_time: 0.00001
+  two_for_one_time: 0.02
+  dt: 0.0005
+  gamma: 1.0
+  temperature: 310.0
+  chunk_frames: 1000
+  inference_batch: 256
+  bins: 64
+  plot_bins: 60
+  kde_bw: 0.05
