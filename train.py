@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 import hashlib
 import json
 import logging
@@ -16,6 +17,7 @@ import urllib.request
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 
 LOG = logging.getLogger("train")
@@ -203,16 +205,16 @@ class Peptides:
         self.ends = np.cumsum([len(item["x"]) for item in self.items])
         self.starts = np.r_[0, self.ends[:-1]]
         self.length = int(self.ends[-1])
+        self.coordinates = np.concatenate([item["x"] for item in self.items])
+        self.feature_table = np.stack([item["features"] for item in self.items])
 
     def batch(self, indices, device):
         owners = np.searchsorted(self.ends, indices, side="right")
         x = torch.empty((len(indices), 30), pin_memory=device.type == "cuda")
         features = torch.empty((len(indices), 10, 4), dtype=torch.long, pin_memory=device.type == "cuda")
         x_np, f_np = x.numpy(), features.numpy()
-        for owner in np.unique(owners):
-            rows = np.flatnonzero(owners == owner)
-            x_np[rows] = self.items[owner]["x"][indices[rows] - self.starts[owner]]
-            f_np[rows] = self.items[owner]["features"]
+        x_np[:] = self.coordinates[indices]
+        f_np[:] = self.feature_table[owners]
         return x.to(device, non_blocking=True), features.to(device, non_blocking=True)
 
 
@@ -290,9 +292,25 @@ def _restore_rng(state, rng, device=None):
 
 
 def _save(path, state):
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
     temporary = path.with_suffix(".tmp")
     torch.save(state, temporary)
     os.replace(temporary, path)
+
+
+def _sum_gradients(model):
+    """Sum global-batch fractions across ranks before clipping and AdamW."""
+    gradients = []
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            if parameter.grad is None:
+                parameter.grad = torch.zeros_like(parameter)
+            gradients.append(parameter.grad)
+    flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    pieces = list(flat.split([gradient.numel() for gradient in gradients]))
+    torch._foreach_copy_(gradients, [piece.view_as(gradient) for piece, gradient in zip(pieces, gradients)])
 
 
 def _optimizer_step(model, optimizer, scheduler, ema, cfg):
@@ -339,6 +357,11 @@ def train(config, args):
     ema = {key: value.detach().clone() for key, value in model.state_dict().items()}
     stages = cfg["mixture_epochs"] if args.method == "mixture" else [cfg["epochs"]]
     batch_size = cfg["batch_size"]
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if batch_size % world_size:
+        raise ValueError("Effective batch size must be divisible by the distributed world size")
+    local_size = batch_size // world_size
     microbatch = args.microbatch or min(128 if args.method == "fokker_planck" else 256, batch_size)
     if microbatch < 1 or microbatch > batch_size:
         raise ValueError("microbatch must be between 1 and the effective batch size")
@@ -367,9 +390,14 @@ def train(config, args):
             _save(run / "final.pt", resume)
         LOG.info("Training schedule already complete: %s", run / "final.pt")
         return
+    if getattr(args, "factorized_attention", False):
+        model.enable_factorized_attention()
+        for expert in model.experts:
+            if not expert.potential:
+                expert._factored_attention = False
     if getattr(args, "compile", False):
         model.enable_compile()
-    LOG.info("%s: %d parameters; %d frames, %d steps/epoch, %d epochs, microbatch %d", args.method, sum(p.numel() for p in model.parameters()), training.length, steps_per_epoch, sum(stages), microbatch)
+    LOG.info("%s: %d parameters; %d frames, %d steps/epoch, %d epochs, microbatch %d, GPUs %d", args.method, sum(p.numel() for p in model.parameters()), training.length, steps_per_epoch, sum(stages), microbatch, world_size)
     epoch = start_epoch
     stage_start = 0
     total_started, step_seconds = time.monotonic(), []
@@ -388,7 +416,10 @@ def train(config, args):
             optimizer.load_state_dict(resume["optimizer"])
             scheduler.load_state_dict(resume["scheduler"])
         def checkpoint(epoch_value, step_value, current_permutation, completed=False):
-            return {"model": model.state_dict(), "ema": ema, "norm_factor": norm, "method": args.method, "config": config, "epoch": epoch_value, "stage": stage, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "rng": _rng_state(rng, device), "global_step": global_step, "step_in_epoch": step_value, "permutation": current_permutation, "completed": completed}
+            return {"model": model.state_dict(), "ema": ema, "norm_factor": norm, "method": args.method, "config": config, "epoch": epoch_value, "stage": stage, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "rng": _rng_state(rng, device), "global_step": global_step, "step_in_epoch": step_value, "permutation": current_permutation, "completed": completed,
+                    "execution": {"factorized_attention": bool(getattr(args, "factorized_attention", False)),
+                                  "factorized_attention_scope": "potential_experts" if getattr(args, "factorized_attention", False) else "original",
+                                  "world_size": world_size, "microbatch": microbatch}}
         while epoch < stage_end:
             model.train()
             if permutation is None:
@@ -406,8 +437,12 @@ def train(config, args):
                 optimizer.zero_grad(set_to_none=True)
                 batch_losses = torch.zeros(3, device=device)
                 try:
-                    for begin in range(0, batch_size, microbatch):
-                        end = min(begin+microbatch, batch_size)
+                    # Every rank draws the same complete batch and stochastic inputs.
+                    # Only the costly loss/gradient calculation is partitioned; the
+                    # saved rank-zero RNG therefore also resumes a single-GPU run.
+                    local_begin, local_end = rank * local_size, (rank + 1) * local_size
+                    for begin in range(local_begin, local_end, microbatch):
+                        end = min(begin+microbatch, local_end)
                         terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage, noise[begin:end], None if vectors is None else vectors[:, begin:end])
                         if not torch.isfinite(terms).all():
                             raise FloatingPointError(f"Nonfinite loss at epoch {epoch+1} step {step+1}: {terms.detach()}")
@@ -415,6 +450,9 @@ def train(config, args):
                         if weighted.requires_grad:
                             weighted.sum().backward()
                         batch_losses += weighted.detach()
+                    if world_size > 1:
+                        _sum_gradients(model)
+                        dist.all_reduce(batch_losses, op=dist.ReduceOp.SUM)
                     _optimizer_step(model, optimizer, scheduler, ema, cfg)
                 except Exception:
                     _save(run / "failure.pt", checkpoint(epoch, step, permutation))
@@ -431,14 +469,17 @@ def train(config, args):
                     LOG.info("epoch %d/%d stage %d step %d/%d loss=%s lr=%.4g %.3fs/step ETA %.1fh", epoch+1, sum(stages), stage+1, step+1, steps_per_epoch, np.round(batch_losses.cpu().numpy(), 6), optimizer.param_groups[0]["lr"], recent, remaining*recent/3600)
                 if args.profile_only and len(step_seconds) >= 3:
                     report = {"method": args.method, "microbatch": microbatch, "batch_size": batch_size, "seconds_per_step": float(np.mean(step_seconds[1:])), "estimated_training_hours": float(np.mean(step_seconds[1:])*steps_per_epoch*sum(stages)/3600), "peak_gpu_gb": torch.cuda.max_memory_allocated(device)/1e9 if device.type == "cuda" else None}
-                    _atomic_json(run / "profile.json", report)
+                    report["world_size"] = world_size
+                    report["factorized_attention"] = bool(getattr(args, "factorized_attention", False))
+                    if rank == 0:
+                        _atomic_json(run / "profile.json", report)
                     LOG.info("Profile: %s", report)
                     return
                 if args.max_steps and global_step >= args.max_steps:
                     _save(run / "latest.pt", checkpoint(epoch, step+1, permutation))
                     LOG.info("Stopped after requested %d optimizer steps; resumable checkpoint saved", args.max_steps)
                     return
-                if (step+1) % cfg.get("checkpoint_steps", 100) == 0:
+                if (step+1) % cfg.get("checkpoint_steps", 1000) == 0:
                     _save(run / "latest.pt", checkpoint(epoch, step+1, permutation))
             # Source SEMA: replace train parameters at every epoch, retain Adam moments.
             model.load_state_dict(ema)
@@ -446,8 +487,9 @@ def train(config, args):
             start_step, permutation = 0, None
             validation_terms = validate(model, validation, config, stage, norm, device, rng, microbatch)
             row = {"epoch": epoch, "stage": stage, "train": (losses_sum/(steps_per_epoch - (resume.get('step_in_epoch', 0) if resume and epoch == start_epoch+1 else 0))).tolist(), "validation": validation_terms.tolist(), "seconds": time.monotonic()-epoch_started}
-            with open(run / "metrics.jsonl", "a") as stream:
-                stream.write(json.dumps(row)+"\n")
+            if rank == 0:
+                with open(run / "metrics.jsonl", "a") as stream:
+                    stream.write(json.dumps(row)+"\n")
             _save(run / "latest.pt", checkpoint(epoch, 0, None))
             if epoch == stage_end:
                 _save(run / f"stage{stage+1}.pt", checkpoint(epoch, 0, None))
@@ -461,21 +503,35 @@ def train(config, args):
 def validate(model, dataset, config, stage, norm, device, rng, microbatch):
     model.eval()
     batch_size = config["training"]["batch_size"]
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
     permutation = rng.permutation(dataset.length)[:dataset.length//batch_size*batch_size]
     total = np.zeros(3)
-    for indices in permutation.reshape(-1, batch_size):
+    for batch_index, indices in enumerate(permutation.reshape(-1, batch_size)):
         x, features = dataset.batch(indices, device)
         x = random_rotations(x)*norm
         lo, hi = [(0.6, 1.), (0.099, 0.6), (1e-5, 0.099)][stage] if model.method == "mixture" else (1e-5, 1.)
         t = torch.rand((len(x), 1), device=device)*(hi-lo)+lo
         for begin in range(0, len(x), microbatch):
             end = min(begin+microbatch, len(x))
+            # Advance identical generators on every rank, including skipped
+            # batches. This retains the original validation RNG sequence.
+            noise = torch.randn_like(x[begin:end])
+            vectors = (config["training"]["sigma"] * torch.randn((2, end-begin, x.shape[1]), device=device)
+                       if model.method == "fokker_planck" else None)
+            if batch_index % world_size != rank:
+                continue
             # Conservative models require local coordinate autograd even in evaluation.
             with torch.no_grad():
-                terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage, training=False)
+                terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage,
+                               noise=noise, vectors=vectors, training=False)
             if not torch.isfinite(terms).all():
                 raise FloatingPointError("Nonfinite validation loss")
             total += terms.detach().cpu().numpy()*((end-begin)/batch_size)
+    if world_size > 1:
+        accumulated = torch.as_tensor(total, dtype=torch.float64, device=device)
+        dist.all_reduce(accumulated, op=dist.ReduceOp.SUM)
+        total = accumulated.cpu().numpy()
     return total/(len(permutation)//batch_size)
 
 
@@ -489,9 +545,20 @@ def main():
     parser.add_argument("--resume")
     parser.add_argument("--profile-only", action="store_true")
     parser.add_argument("--compile", action="store_true", help="Compile unchanged expert calculations with TorchInductor")
+    parser.add_argument("--factorized-attention", action="store_true", help="Factor affine relative-edge attention in potential experts; retain original direct-score experts")
+    parser.add_argument("--distributed", action="store_true", help="Partition the global batch across torchrun ranks, summing gradients before clipping")
     parser.add_argument("--max-steps", type=int)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.distributed:
+        if "LOCAL_RANK" not in os.environ:
+            parser.error("--distributed must be launched with python -m torch.distributed.run")
+        args.device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+        torch.cuda.set_device(args.device)
+        # Compilation and full validation can exceed NCCL's default timeout.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=4))
+        if dist.get_rank() != 0:
+            LOG.disabled = True
     torch.set_num_threads(4)
     config = load_config(args.config)
     if args.prepare_data:
@@ -500,6 +567,8 @@ def main():
         train(config, args)
     else:
         parser.error("Specify --prepare-data or --method")
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

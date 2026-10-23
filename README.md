@@ -11,10 +11,125 @@ simulation, metrics, and plots). Configuration lives in `configs/`; all download
 data and generated artifacts live in `data/`. Models and automatic differentiation
 use PyTorch only.
 
+## Running on this server
+
+The complete handoff data from `~/ggf_md_handoff.tar.gz` has been unpacked into
+`data/`. The archive checksum and all 684 processed arrays have been checked;
+`data/results/server-validation.json` records the dataset hashes, split sizes,
+canonical atom features, and training-only normalization. The pinned environment
+is `/home/anirudh/.local/venvs/ggf_md`; `data/server-environment.json` records its
+versions and interpreter dependency.
+
+The controller runs the full training and evaluation protocol and resumes saved
+progress. Diffusion and Mixture each use one GPU. Fokker–Planck can use two GPUs
+with the same effective batch of 1024: both ranks draw identical global inputs,
+partition the loss, and sum parameter gradients before clipping and AdamW.
+Validation batches are partitioned while preserving the random-generator state.
+
+```bash
+PYTHON=/home/anirudh/.local/venvs/ggf_md/bin/python
+GGF_OUTPUT_ROOT=/dm7100f/logs/anirudh-ggf_md-20261022
+export TMPDIR="$GGF_OUTPUT_ROOT/runtime-tmp"
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_anirudh
+TORCHINDUCTOR_COMPILE_THREADS=4 nohup "$PYTHON" -u scripts/run_experiment.py \
+  --gpus 0,1,2,3 --fp-gpus 2,3 --microbatches 1024,1024,512 \
+  --compile --cuda-graphs --inference-cache --fp-factorized-attention \
+  --factorized-training diffusion,mixture --factorized-inference \
+  > "$GGF_OUTPUT_ROOT/controller.log" 2>&1 &
+"$PYTHON" scripts/run_experiment.py --status
+```
+
+On this server, `data/runs`, `data/results`, and `data/experiment` are directory
+symlinks into `$GGF_OUTPUT_ROOT/data`. The compiler-cache directory
+`/tmp/torchinductor_anirudh` also points into that output root. Outputs were moved
+on October 22 after the local disk filled; every copied file and all three resume
+checkpoints were verified before restarting the original training commands.
+The processed dataset, source, and environment remain local. The retained handoff
+archive is stored in `$GGF_OUTPUT_ROOT/handoff/`; its original
+`~/ggf_md_handoff.tar.gz` path is a symlink to the verified copy. The companion
+checksum remains at `~/ggf_md_handoff.tar.gz.sha256`.
+Copy manifests, storage checks, and restart records are in
+`$GGF_OUTPUT_ROOT/relocation` and `$GGF_OUTPUT_ROOT/.storage-validation`.
+Keep the scratch and compiler-cache environment variables above on restarts.
+
+Live task records and logs are in `data/experiment/`. Restarting the same
+controller adopts verified live workers; terminal failed stages require
+`--retry-failed` after the cause is resolved. Evaluation uses available GPUs as
+training finishes. Two-for-One starts from the completed Diffusion checkpoint;
+its independent samples are shared safely with Diffusion. The new `--iid-only`
+and `--simulation-only` evaluation flags allow the controller to schedule these
+stages independently.
+
+The controller can run IID generation and simulation concurrently on separate
+available GPUs after the corresponding model finishes training. Simulation still
+advances all 150 paths together; each phase retains its original random generator
+and calculations. Writer locks prevent duplicate phase jobs, while full, profile,
+and metrics commands remain exclusive. Serialized/concurrent CPU and resume
+checks are in `data/validation/evaluation-overlap/`; the controller transition
+is recorded in `data/experiment/evaluation-overlap-transition/`.
+
+The production Fokker–Planck run uses factored relative-edge attention. Its
+affine edge terms can be written as `A*x[j] - A*x[i] + b`; the query-row constant
+cancels inside softmax. Computing the same attention with node projections
+preserves all parameters and derivatives while avoiding large pairwise tensors.
+Float32 operation ordering changes rounding; full-model float64 and CUDA checks
+found accuracy comparable to the original calculation. Compiled two-GPU resume
+retained bitwise-identical weights, EMA, and random states. Reports are under
+`data/results/factored-*.json`, and the saved transition at optimizer step 4500
+is recorded in `data/experiment/fp-factorized-transition/`.
+
+The extension in `data/experiment/attention-extension-transition/` preserves
+source snapshots and rollout checks. Training factors potential experts only:
+Diffusion, Fokker–Planck, and the low-time Mixture expert. The two direct-score
+Mixture experts retain the original calculation. Checkpoint resumes preserve
+weights, EMA, Adam moments, scheduler, and random-generator states; the controller
+adopts the unchanged live FP worker. Effective batches and full schedules remain
+unchanged. Training-loss rows for an epoch interrupted by a resume average the
+remaining batches; validation still runs the complete validation protocol.
+
+Short profiles on shared GPUs measured **2.03× Diffusion training**, **1.59×
+simulation**, and **1.67× IID generation** throughput. These are performance
+checks, not completed replication results. Evidence:
+
+- [Training timings](data/results/factored-other-training-benchmark.json) and
+  [mixed-stage derivative checks](data/validation/factored-other-training/mixed-cpu/report.json).
+- [Inference checks](data/validation/factored-inference/final-manifest.json) and
+  [inference timings](data/validation/factored-inference/benchmark-summary.json).
+- [Controller migration tests](data/validation/factored-other-training/controller-checks.json)
+  and [independent review](data/validation/factored-other-training/independent-controller-review.json).
+
+Training gathers batches from a contiguous in-memory copy of each split,
+using about 1.47 GB of additional host RAM per process. Real-data checks found
+byte-identical inputs and unchanged random states; CPU training, validation,
+and interrupted resumes matched exactly in float32 and float64. Paired CPU
+batch-preparation timings improved 5.1–9.5×; this does not measure GPU training
+throughput. Evidence is in `data/validation/vectorized-batching/`, and source,
+checkpoint, and process records are in
+`data/experiment/vectorized-batching-transition/`.
+
+Periodic recovery checkpoints are saved every 1,000 optimizer steps. This
+reduces serialization overhead; epoch, stage, final, failure, and requested-stop
+checkpoints retain their existing save points. The training configuration,
+updates, and random sequence are unchanged. An abrupt stop can lose up to 999
+unsaved updates. Paired production-log measurements and exact CPU training/resume
+checks are in `data/validation/checkpoint-io/` and
+`data/validation/checkpoint-cadence/`; source and frozen resume checkpoints are
+retained in `data/experiment/checkpoint-cadence-transition/`.
+
+Completion requires all three full training schedules, all four methods on all
+15 peptides, complete IID samples and simulation trajectories, metrics, and PMF
+plots. The controller writes `data/experiment/completion_audit.json` only after
+checking those artifacts. Run the audit independently with:
+
+```bash
+"$PYTHON" scripts/run_experiment.py --audit-only
+```
+
 ## Handoff to another server
 
-**No production training has been launched.** All three training methods are
-enabled. The prepared bundle is `data/ggf_md_handoff.tar.gz`; it includes the code,
+At the time the handoff was prepared, no production training had been launched.
+All three training methods are enabled. The prepared bundle is
+`~/ggf_md_handoff.tar.gz`; it includes the code,
 environment recipe, configuration, validation reports, and the 1.9 GiB processed
 dataset. It omits the original download volumes and raw files because training
 and evaluation can use the processed cache directly.
@@ -22,7 +137,7 @@ and evaluation can use the processed cache directly.
 Copy the bundle, replacing `USER@SERVER` with your destination:
 
 ```bash
-scp /home/anirudh/ggf_md/data/ggf_md_handoff.tar.gz{,.sha256} USER@SERVER:~/
+scp /home/anirudh/ggf_md_handoff.tar.gz{,.sha256} USER@SERVER:~/
 ```
 
 On that server:
@@ -68,6 +183,16 @@ The validated inference cache combines adjacent frozen linear projections.
 It retains the same weights and mathematical function, with small float32
 rounding differences; omit its flag to use the original operation ordering.
 Evaluation includes Diffusion, Two-for-One, Mixture, and Fokker–Planck.
+
+For a fresh evaluation, an optional alternative also factors potential-expert
+attention while retaining original direct-score Mixture experts:
+
+```bash
+python evaluate.py --method all --device cuda:0 --compile --cuda-graphs --inference-cache --factorized-attention
+```
+
+Choose the attention mode before generating samples and keep it when resuming;
+saved metadata checks prevent mixing modes.
 
 ## Environment
 

@@ -47,13 +47,22 @@ class Attention(nn.Module):
         self.register_buffer("_edge_weight", None, persistent=False)
         self.register_buffer("_edge_bias", None, persistent=False)
 
-    def forward(self, nodes, edges):
+    def forward(self, nodes, edges, factored_positions=None, factored_bias=None):
         b, n, _ = nodes.shape
 
         def heads(x):
             return x.reshape(b, *x.shape[1:-1], self.heads, self.head_dim).movedim(-2, 1)
 
         q, k, v = (heads(layer(nodes)) for layer in (self.q, self.k, self.v))
+        if factored_positions is not None:
+            # edge[i,j] = A*x[j] - A*x[i] + b. The query-row
+            # constant -A*x[i] + b cancels exactly inside softmax.
+            positions = heads(factored_positions)
+            similarity = torch.matmul(q, (k + positions).transpose(-1, -2)) * self.head_dim**-0.5
+            attention = similarity.softmax(dim=-1)
+            out = torch.matmul(attention, v + positions) - positions
+            out = out + factored_bias.reshape(1, self.heads, 1, self.head_dim)
+            return self.out(out.transpose(1, 2).reshape(b, n, -1))
         edge = heads(self.edge_kv(edges) if self._edge_weight is None else
                      F.linear(edges, self._edge_weight, self._edge_bias))
         # The same edge embedding is added to both keys and values.
@@ -76,8 +85,9 @@ class TransformerLayer(nn.Module):
         self.feedforward_out = nn.Linear(4 * width, width)
         self.feedforward_residual = GatedResidual(width)
 
-    def forward(self, nodes, edges):
-        nodes = self.attention_residual(self.attention(self.attention_norm(nodes), edges), nodes)
+    def forward(self, nodes, edges, factored_positions=None, factored_bias=None):
+        nodes = self.attention_residual(self.attention(self.attention_norm(nodes), edges,
+                                                     factored_positions, factored_bias), nodes)
         h = self.feedforward_norm(nodes)
         h = self.feedforward_out(F.gelu(self.feedforward_in(h), approximate="tanh"))
         return self.feedforward_residual(h, nodes)
@@ -98,6 +108,7 @@ class GraphTransformer(nn.Module):
         self._compiled_forward = None
         self._compiled_potential = None
         self._inference_cache = False
+        self._factored_attention = False
 
     def time_features(self, t):
         t = t.clamp(self.t0, self.t1)
@@ -115,6 +126,20 @@ class GraphTransformer(nn.Module):
                               for i, embedding in enumerate(self.scalar_embeddings)], dim=-1)
         time = self.time_features(t).unsqueeze(1).expand(-1, x.shape[1], -1)
         nodes = self.node_embedding(torch.cat((embedded, time), dim=-1))
+        if self._factored_attention:
+            for layer in self.layers:
+                attention = layer.attention
+                if attention._edge_weight is None:
+                    projection = attention.edge_kv
+                    weight = projection.weight @ self.edge_embedding.weight
+                    bias = projection.bias + projection.weight @ self.edge_embedding.bias
+                else:
+                    weight, bias = attention._edge_weight, attention._edge_bias
+                positions = F.linear(x, weight, bias=None)
+                nodes = layer(nodes, None, positions, bias)
+            if self.potential:
+                return self.node_decoder(nodes)
+            return self.node_decoder(nodes.flatten(1)).reshape_as(x)
         # Source xa=x[:, None], xb=x[:, :, None]: edge[i,j]=x[j]-x[i].
         edges = x[:, None, :, :] - x[:, :, None, :]
         if not self._inference_cache:
@@ -196,6 +221,21 @@ class DipeptideModel(nn.Module):
             expert._compiled_forward = torch.compile(expert._differentiable_forward, fullgraph=True)
             if expert.potential:
                 expert._compiled_potential = torch.compile(expert._functional_potential, fullgraph=True)
+        return self
+
+    def enable_factorized_attention(self, enabled=True):
+        """Compute exact affine relative-edge attention without pairwise edges.
+
+        Trainable forwards recompute affine composition with ordinary autograd.
+        Frozen inference can reuse the validated affine projection cache.
+        Plain matmul/softmax retains all coordinate and parameter derivatives.
+        The disabled path and all checkpoint keys stay unchanged.
+        """
+        if (enabled and any(expert._inference_cache for expert in self.experts)
+                and any(parameter.requires_grad for parameter in self.parameters())):
+            raise ValueError("Freeze model parameters before combining factored attention and inference caching.")
+        for expert in self.experts:
+            expert._factored_attention = bool(enabled)
         return self
 
     def enable_inference_cache(self):

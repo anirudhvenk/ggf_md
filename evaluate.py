@@ -1,6 +1,8 @@
 """Independent generation, resumable Langevin simulation, and dipeptide metrics."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import math
@@ -32,6 +34,24 @@ PROTOCOL_KEYS = ("peptides", "seed", "simulation_steps", "save_every", "replicas
                  "two_for_one_time", "dt", "gamma", "temperature")
 MASS = np.repeat([14.00672, 12.01078, 12.01078, 12.01078, 15.99943] * 2, 3)
 R_GAS = .00831446261815324  # kJ mol^-1 K^-1
+
+
+@contextmanager
+def process_lock(path, shared=False):
+    """Coordinate readers/phases and writers; the OS releases locks after a crash."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        try:
+            fcntl.flock(handle, mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"Waiting for another evaluation process: {path}", flush=True)
+            fcntl.flock(handle, mode)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def atomic_save(value, path):
@@ -151,6 +171,31 @@ def load_model(config, method, device, checkpoint=None):
     return model, float(state["norm_factor"]), checkpoint, file_hash(checkpoint)
 
 
+def assert_inference_score_close(actual, reference):
+    if actual.shape != reference.shape or actual.dtype != reference.dtype:
+        raise AssertionError("Inference score shape/dtype differs from the reference")
+    if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
+        raise AssertionError("Inference score or its reference contains nonfinite values")
+    error = torch.linalg.vector_norm((actual - reference).double().reshape(len(actual), -1), dim=-1)
+    scale = torch.linalg.vector_norm(reference.double().reshape(len(reference), -1), dim=-1).clamp_min(1e-12)
+    if torch.any(error > 2e-5 * scale):
+        raise AssertionError(f"Inference score differs from the reference: "
+                             f"maximum per-sample relative L2={float((error / scale).max()):.6g}")
+
+
+def factorized_attention_identity(model):
+    flags = [expert._factored_attention for expert in model.experts]
+    if not any(flags):
+        return {}
+    if flags == [expert.potential for expert in model.experts]:
+        scope = "potential_experts"
+    elif all(flags):
+        scope = "all_experts"
+    else:
+        scope = "experts_" + "_".join(str(i) for i, enabled in enumerate(flags) if enabled)
+    return {"factorized_attention": True, "factorized_attention_scope": scope}
+
+
 def cache_inference_checked(model, split, config, norm, device):
     sequence = config["evaluation"]["peptides"][0]
     x = torch.tensor(np.asarray(split[sequence]["x"][:2]), device=device) * norm
@@ -160,7 +205,30 @@ def cache_inference_checked(model, split, config, norm, device):
     model.enable_inference_cache()
     for scalar_time, reference in zip(times, references):
         actual = model(x, features, torch.full((len(x), 1), scalar_time, device=device))
-        torch.testing.assert_close(actual, reference, rtol=2e-5, atol=2e-5)
+        assert_inference_score_close(actual, reference)
+
+
+def factorized_inference_checked(model, split, config, norm, device):
+    """Validate the original score before enabling optional factored inference."""
+    if any(expert._inference_cache for expert in model.experts):
+        raise ValueError("Validate factored attention before enabling the frozen inference cache")
+    sequence = config["evaluation"]["peptides"][0]
+    dtype = next(model.parameters()).dtype
+    x = torch.as_tensor(np.asarray(split[sequence]["x"][:2]).copy(), dtype=dtype, device=device) * norm
+    features = torch.as_tensor(split[sequence]["features"], device=device).unsqueeze(0).expand(len(x), -1, -1)
+    times = (0., 1e-5, .03, .1, .35, .6, .8, 1.) if model.method == "mixture" else (1e-5, .02, .3, 1.)
+    references = [model(x, features, torch.full((len(x), 1), t, dtype=dtype, device=device)).detach()
+                  for t in times]
+    model.enable_factorized_attention()
+    if model.method == "mixture":
+        for expert in model.experts:
+            if not expert.potential:
+                expert._factored_attention = False
+    for scalar_time, reference in zip(times, references):
+        actual = model(x, features, torch.full((len(x), 1), scalar_time, dtype=dtype, device=device))
+        # Keep every independent sample within tolerance, including its full
+        # score vector when individual near-zero components change rounding.
+        assert_inference_score_close(actual, reference)
 
 
 def reverse_diffusion(score, features, n, steps, generator, norm_factor):
@@ -180,11 +248,19 @@ def reverse_diffusion(score, features, n, steps, generator, norm_factor):
 
 
 def generate_iid(config, split, model, norm, checkpoint_hash, directory, device, compiled=False):
+    # Diffusion and Two-for-One deliberately share these samples. A lock allows
+    # concurrent per-method jobs to wait for that dependency and then resume/skip.
+    with process_lock(directory / ".iid.lock"):
+        return _generate_iid(config, split, model, norm, checkpoint_hash, directory, device, compiled)
+
+
+def _generate_iid(config, split, model, norm, checkpoint_hash, directory, device, compiled=False):
     settings = config["evaluation"]
     directory.mkdir(parents=True, exist_ok=True)
     identity = {"checkpoint": checkpoint_hash, "norm_factor": norm, "samples": settings["num_iid_samples"],
                 "steps": settings["diffusion_steps"], "seed": settings["seed"], "batch": settings["inference_batch"],
-                "compiled": compiled, "inference_cache": model.experts[0]._inference_cache}
+                "compiled": compiled, "inference_cache": model.experts[0]._inference_cache,
+                **factorized_attention_identity(model)}
     metadata = directory / "iid_metadata.json"
     if metadata.exists() and json.loads(metadata.read_text()) != identity:
         raise ValueError(f"IID settings/checkpoint differ from {metadata}; use a fresh output directory")
@@ -222,6 +298,17 @@ def langevin_step(x, v, noise, score, features, t, scalar_time, norm, mass, kbt,
     return (x + dt * v_new).detach(), v_new.detach()
 
 
+def assert_simulation_state_close(actual, expected, *, rtol, atol):
+    """Preserve finite arithmetic checks and match divergence patterns exactly."""
+    for label, predicate in (("NaN", torch.isnan), ("positive infinity", torch.isposinf),
+                             ("negative infinity", torch.isneginf)):
+        if not torch.equal(predicate(actual), predicate(expected)):
+            raise AssertionError(f"Simulation state {label} patterns differ")
+    # Matching NaNs represent the same diverged paths. All finite components
+    # still use the original tolerances, including finite entries in dead rows.
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=True)
+
+
 def capture_step(step, x, v, generator):
     """Capture deterministic arithmetic; keep noise outside for exact RNG resume."""
     noise = torch.zeros_like(x)
@@ -248,8 +335,8 @@ def capture_step(step, x, v, generator):
     expected_x, expected_v = step(x, v, noise)
     graph.replay()
     torch.cuda.synchronize(x.device)
-    torch.testing.assert_close(static_x, expected_x, rtol=2e-5, atol=2e-6)
-    torch.testing.assert_close(static_v, expected_v, rtol=2e-5, atol=2e-6)
+    assert_simulation_state_close(static_x, expected_x, rtol=2e-5, atol=2e-6)
+    assert_simulation_state_close(static_v, expected_v, rtol=2e-5, atol=2e-6)
     static_x.copy_(x)
     static_v.copy_(v)
     def replay():
@@ -280,12 +367,30 @@ def simulation_setup(config, split, model, norm, device, compiled):
     score = make_score(model, compiled)
     with torch.enable_grad():
         reference = model(x * norm, features, t, create_graph=False).detach()
-    torch.testing.assert_close(score(x * norm, features, t, scalar_time), reference, rtol=2e-5, atol=2e-5)
+    assert_inference_score_close(score(x * norm, features, t, scalar_time), reference)
     alpha = torch.exp(torch.tensor(-settings["gamma"] * settings["dt"], dtype=x.dtype, device=device))
     def step(x, v, noise):
         return langevin_step(x, v, noise, score, features, t, scalar_time, norm, mass, kbt,
                              alpha, (1 - alpha) / settings["gamma"], settings["dt"])
     return x, v, generator, step
+
+
+def write_simulation_complete(settings, directory, completed, alive):
+    """Publish completion from committed state, including after a final-save crash."""
+    if completed != settings["simulation_steps"]:
+        raise ValueError("Cannot mark an incomplete simulation complete")
+    alive = np.asarray(alive, dtype=bool)
+    if alive.shape != (len(settings["peptides"]) * settings["replicas"],):
+        raise ValueError("Saved simulation alive-path count differs from the protocol")
+    shape = (settings["replicas"], completed // settings["save_every"], 30)
+    for sequence in settings["peptides"]:
+        path = directory / f"{sequence}_simulation.npy"
+        array = np.load(path, mmap_mode="r")
+        if array.shape != shape or array.dtype != np.float32:
+            raise ValueError(f"Saved simulation shape/dtype differs from the protocol: {path}")
+    write_json({"complete": True, "steps_per_path": completed, "replicas": settings["replicas"],
+                "aggregate_ns_per_peptide": completed * settings["dt"] * settings["replicas"] / 1000,
+                "alive_paths": alive.tolist()}, directory / "simulation_complete.json")
 
 
 def simulate(config, split, model, norm, checkpoint_hash, directory, device, compiled=False,
@@ -296,7 +401,8 @@ def simulate(config, split, model, norm, checkpoint_hash, directory, device, com
     nframes = settings["simulation_steps"] // settings["save_every"]
     identity = {"checkpoint": checkpoint_hash, "norm_factor": norm,
                 **{key: settings[key] for key in PROTOCOL_KEYS}, "method": model.method,
-                "compiled": compiled, "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache}
+                "compiled": compiled, "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache,
+                **factorized_attention_identity(model)}
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory / "simulation_metadata.json"
     if not profile_steps and metadata.exists() and json.loads(metadata.read_text()) != identity:
@@ -313,6 +419,7 @@ def simulate(config, split, model, norm, checkpoint_hash, directory, device, com
         v.copy_(state["v"].to(device))
         generator.set_state(state["rng"])
     if completed == settings["simulation_steps"] and not profile_steps:
+        write_simulation_complete(settings, directory, completed, alive)
         return
     if cuda_graphs:
         if device.type != "cuda":
@@ -340,6 +447,7 @@ def simulate(config, split, model, norm, checkpoint_hash, directory, device, com
         seconds = time.monotonic() - start
         profile = {"steps": profile_steps, "seconds": seconds, "paths": len(x), "compile": compiled,
                    "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache,
+                   **factorized_attention_identity(model),
                    "steps_per_second": profile_steps / seconds,
                    "full_simulation_hours": settings["simulation_steps"] * seconds / profile_steps / 3600}
         write_json(profile, directory / "profile.json")
@@ -374,9 +482,7 @@ def simulate(config, split, model, norm, checkpoint_hash, directory, device, com
         elapsed = time.monotonic() - start
         print(f"Saved {model.method}: {completed}/{settings['simulation_steps']}, "
               f"alive {alive.sum()}/{len(alive)}, {elapsed / 60:.1f} min this session", flush=True)
-    write_json({"complete": True, "steps_per_path": completed, "replicas": settings["replicas"],
-                "aggregate_ns_per_peptide": completed * settings["dt"] * settings["replicas"] / 1000,
-                "alive_paths": alive.tolist()}, directory / "simulation_complete.json")
+    write_simulation_complete(settings, directory, completed, alive)
 
 
 def plot_results(truth, iid, simulation, sequence, directory, settings):
@@ -455,9 +561,12 @@ def evaluate_outputs(config, split, method, directory, iid_directory):
         plot_results(truth[np.isfinite(truth).all(1)], iid[np.isfinite(iid).all(1)],
                      simulation[np.isfinite(simulation).all(1)], sequence, directory, settings)
     frame = pd.DataFrame(rows)
-    frame.to_csv(directory / "metrics.csv", index=False)
-    write_json(rows, directory / "metrics.json")
-    write_json(metrics_identity(settings), directory / "metrics_metadata.json")
+    # Publish the metric files together relative to summary readers. The heavy
+    # sampling and plotting above remain independent across method processes.
+    with process_lock(directory.parent / ".summary.lock"):
+        frame.to_csv(directory / "metrics.csv", index=False)
+        write_json(rows, directory / "metrics.json")
+        write_json(metrics_identity(settings), directory / "metrics_metadata.json")
     return frame
 
 
@@ -508,10 +617,14 @@ def main():
     parser.add_argument("--checkpoint")
     parser.add_argument("--compile", action="store_true", help="Compile static expert score functions; validates against eager")
     parser.add_argument("--inference-cache", action="store_true", help="Compose frozen adjacent edge projections; validates score equivalence")
+    parser.add_argument("--factorized-attention", action="store_true", help="Use exact factored affine edge attention; validates original scores before caching")
     parser.add_argument("--cuda-graphs", action="store_true", help="Capture simulation arithmetic; validates one-step equivalence")
-    parser.add_argument("--profile-only", action="store_true")
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument("--profile-only", action="store_true")
+    phase.add_argument("--metrics-only", action="store_true")
+    phase.add_argument("--iid-only", action="store_true", help="Generate/resume independent samples only")
+    phase.add_argument("--simulation-only", action="store_true", help="Generate/resume Langevin trajectories only")
     parser.add_argument("--profile-steps", type=int, default=100)
-    parser.add_argument("--metrics-only", action="store_true")
     parser.add_argument("--iid-samples", type=int)
     parser.add_argument("--simulation-steps", type=int)
     parser.add_argument("--replicas", type=int)
@@ -520,8 +633,6 @@ def main():
     args = parser.parse_args()
     if args.checkpoint and args.method == "all":
         parser.error("--checkpoint requires a single --method")
-    if args.metrics_only and args.profile_only:
-        parser.error("--metrics-only and --profile-only are mutually exclusive")
     config = load_config(args.config)
     settings = config["evaluation"]
     configured_methods = tuple(settings.get("methods", METHODS))
@@ -559,36 +670,43 @@ def main():
         directory = result_root / method
         directory.mkdir(parents=True, exist_ok=True)
         iid_directory = result_root / ("diffusion" if method == "two_for_one" else method)
-        if not args.metrics_only:
-            model, norm, checkpoint, digest = load_model(config, method, device, args.checkpoint)
-            # Keep the same weights while distinguishing Two-for-One's simulation time.
-            model.method = method
-            print(f"Evaluating {method}: {checkpoint} on {device}", flush=True)
-            if args.inference_cache:
-                cache_inference_checked(model, split, config, norm, device)
-            if not args.profile_only:
-                generate_iid(config, split, model, norm, digest, iid_directory, device, args.compile)
-            simulate(config, split, model, norm, digest, directory, device, args.compile,
-                     args.cuda_graphs, args.profile_steps if args.profile_only else 0)
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        if not args.profile_only:
-            frames.append(evaluate_outputs(config, split, method, directory, iid_directory))
+        # Separate phase writers may overlap; complete/default readers stay exclusive.
+        with process_lock(directory / ".evaluation.lock", shared=args.iid_only or args.simulation_only):
+            if not args.metrics_only:
+                model, norm, checkpoint, digest = load_model(config, method, device, args.checkpoint)
+                # Keep the same weights while distinguishing Two-for-One's simulation time.
+                model.method = method
+                print(f"Evaluating {method}: {checkpoint} on {device}", flush=True)
+                if args.factorized_attention:
+                    factorized_inference_checked(model, split, config, norm, device)
+                if args.inference_cache:
+                    cache_inference_checked(model, split, config, norm, device)
+                if not (args.profile_only or args.simulation_only):
+                    generate_iid(config, split, model, norm, digest, iid_directory, device, args.compile)
+                if not args.iid_only:
+                    with process_lock(directory / ".simulation.lock"):
+                        simulate(config, split, model, norm, digest, directory, device, args.compile,
+                                 args.cuda_graphs, args.profile_steps if args.profile_only else 0)
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            if not (args.profile_only or args.iid_only or args.simulation_only):
+                frames.append(evaluate_outputs(config, split, method, directory, iid_directory))
     if frames:
         # Include other already completed methods when an individual method finishes.
-        by_method = {frame.iloc[0]["method"]: frame for frame in frames}
-        for method in configured_methods:
-            existing = result_root / method / "metrics.csv"
-            if method not in by_method and existing.exists():
-                metadata = existing.with_name("metrics_metadata.json")
-                if not metadata.exists() or json.loads(metadata.read_text()) != metrics_identity(settings):
-                    raise ValueError(f"Incompatible saved metrics: {existing}. Recompute with --method all --metrics-only")
-                frame = pd.read_csv(existing)
-                if set(frame.peptide) != set(settings["peptides"]) or frame.peptide.duplicated().any():
-                    raise ValueError(f"Saved metrics have an incompatible peptide list: {existing}")
-                by_method[method] = frame
-        write_summary(result_root, list(by_method.values()), settings)
+        with process_lock(result_root / ".summary.lock"):
+            by_method = {frame.iloc[0]["method"]: frame for frame in frames}
+            for method in configured_methods:
+                existing = result_root / method / "metrics.csv"
+                if method not in by_method and existing.exists():
+                    metadata = existing.with_name("metrics_metadata.json")
+                    if not metadata.exists() or json.loads(metadata.read_text()) != metrics_identity(settings):
+                        raise ValueError(f"Incompatible saved metrics: {existing}. Recompute with --method all --metrics-only")
+                    frame = pd.read_csv(existing)
+                    if set(frame.peptide) != set(settings["peptides"]) or frame.peptide.duplicated().any():
+                        raise ValueError(f"Saved metrics have an incompatible peptide list: {existing}")
+                    by_method[method] = frame
+            write_summary(result_root, list(by_method.values()), settings)
 
 
 if __name__ == "__main__":
