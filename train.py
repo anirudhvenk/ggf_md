@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 import yaml
 
+from ggf_score_matching import ggf_identity, ggf_score_matching, sample_noise_std
+
 LOG = logging.getLogger("train")
 AMINO_ACIDS = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLY", "GLU", "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"]
 ATOMS = ["N", "CA", "CB", "C", "O"]
@@ -236,8 +238,16 @@ def time_weights(t, stage, mixture, config):
     return torch.where(t.reshape(-1) <= mid, (hi-lo)/(mid-lo)/2, (hi-lo)/(hi-mid)/2)
 
 
-def losses(model, x, features, t, config, stage=0, noise=None, vectors=None, training=True):
-    """DSM and source residual FP; fixed noise/vectors support numerical reference checks."""
+def losses(model, x, features, t, config, stage=0, noise=None, vectors=None, training=True,
+           noise_std=None):
+    """GGF or original DSM/FP; optional fixed draws support numerical checks."""
+    if model.method == "ggf":
+        identity = ggf_identity(config)
+        value = ggf_score_matching(
+            lambda query: model(query, features, t, create_graph=training), x,
+            identity["sigma_min"], sigma_max=identity["sigma_max"],
+            noise=noise, noise_std=noise_std)
+        return torch.stack((value, x.new_zeros(()), x.new_zeros(())))
     cfg = config["training"]
     active = ([0], [0, 1], [1, 2])[stage] if model.method == "mixture" else None
     log_mean = -0.5 * t * 0.1 - 0.25 * t.square() * (20.0 - 0.1)
@@ -291,6 +301,20 @@ def _restore_rng(state, rng, device=None):
     random.setstate(state["python"])
 
 
+def check_resume_compatible(resume, method, config, norm):
+    """Bind resumable weights and RNG to the complete training objective."""
+    if resume["method"] != method or any(resume["config"][key] != config[key]
+                                         for key in ("model", "training")):
+        raise ValueError("Resume method/model/training settings differ from checkpoint")
+    if method == "ggf":
+        identity = ggf_identity(config)
+        if (resume["config"].get("ggf") != config["ggf"]
+                or resume.get("ggf") != identity):
+            raise ValueError("Resume GGF settings or objective identity differ from checkpoint")
+    if not np.isclose(resume["norm_factor"], norm, rtol=1e-8, atol=0):
+        raise ValueError("Resume data normalization differs from checkpoint")
+
+
 def _save(path, state):
     if dist.is_initialized() and dist.get_rank() != 0:
         return
@@ -339,6 +363,9 @@ def train(config, args):
     enabled = cfg.get("methods", ["diffusion", "mixture", "fokker_planck"])
     if args.method not in enabled:
         raise ValueError(f"Training method {args.method!r} is disabled by training.methods; enabled methods: {enabled}")
+    objective = ggf_identity(config) if args.method == "ggf" else None
+    if objective is not None:
+        LOG.info("GGF objective: %s", json.dumps(objective, sort_keys=True))
     seed = cfg["seed"]
     device = torch.device(args.device)
     random.seed(seed)
@@ -376,10 +403,7 @@ def train(config, args):
     start_step = resume.get("step_in_epoch", 0) if resume else 0
     permutation = resume.get("permutation") if resume else None
     if resume:
-        if resume["method"] != args.method or any(resume["config"][key] != config[key] for key in ("model", "training")):
-            raise ValueError("Resume method/model/training settings differ from checkpoint")
-        if not np.isclose(resume["norm_factor"], norm, rtol=1e-8, atol=0):
-            raise ValueError("Resume data normalization differs from checkpoint")
+        check_resume_compatible(resume, args.method, config, norm)
         model.load_state_dict(resume["model"])
         ema = {key: value.to(device) for key, value in resume["ema"].items()}
         _restore_rng(resume["rng"], rng, device)
@@ -417,6 +441,7 @@ def train(config, args):
             scheduler.load_state_dict(resume["scheduler"])
         def checkpoint(epoch_value, step_value, current_permutation, completed=False):
             return {"model": model.state_dict(), "ema": ema, "norm_factor": norm, "method": args.method, "config": config, "epoch": epoch_value, "stage": stage, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "rng": _rng_state(rng, device), "global_step": global_step, "step_in_epoch": step_value, "permutation": current_permutation, "completed": completed,
+                    **({"ggf": objective} if objective is not None else {}),
                     "execution": {"factorized_attention": bool(getattr(args, "factorized_attention", False)),
                                   "factorized_attention_scope": "potential_experts" if getattr(args, "factorized_attention", False) else "original",
                                   "world_size": world_size, "microbatch": microbatch}}
@@ -430,10 +455,17 @@ def train(config, args):
                 began = time.monotonic()
                 x, features = training.batch(permutation[step*batch_size:(step+1)*batch_size], device)
                 x = random_rotations(x) * norm
-                lo, hi = [(0.6, 1.), (0.099, 0.6), (1e-5, 0.099)][stage] if args.method == "mixture" else (1e-5, 1.)
-                t = torch.rand((batch_size, 1), device=device) * (hi-lo) + lo
-                noise = torch.randn_like(x)
-                vectors = cfg["sigma"] * torch.randn((2, *x.shape), device=device) if args.method == "fokker_planck" else None
+                noise_std = None
+                if args.method == "ggf":
+                    t = x.new_zeros((batch_size, 1))
+                    noise_std = sample_noise_std(x, objective["sigma_min"], objective["sigma_max"])
+                    noise = torch.randn_like(x)
+                    vectors = None
+                else:
+                    lo, hi = [(0.6, 1.), (0.099, 0.6), (1e-5, 0.099)][stage] if args.method == "mixture" else (1e-5, 1.)
+                    t = torch.rand((batch_size, 1), device=device) * (hi-lo) + lo
+                    noise = torch.randn_like(x)
+                    vectors = cfg["sigma"] * torch.randn((2, *x.shape), device=device) if args.method == "fokker_planck" else None
                 optimizer.zero_grad(set_to_none=True)
                 batch_losses = torch.zeros(3, device=device)
                 try:
@@ -443,7 +475,8 @@ def train(config, args):
                     local_begin, local_end = rank * local_size, (rank + 1) * local_size
                     for begin in range(local_begin, local_end, microbatch):
                         end = min(begin+microbatch, local_end)
-                        terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage, noise[begin:end], None if vectors is None else vectors[:, begin:end])
+                        terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage, noise[begin:end], None if vectors is None else vectors[:, begin:end],
+                                       noise_std=None if noise_std is None else noise_std[begin:end])
                         if not torch.isfinite(terms).all():
                             raise FloatingPointError(f"Nonfinite loss at epoch {epoch+1} step {step+1}: {terms.detach()}")
                         weighted = terms * ((end-begin)/batch_size)
@@ -471,6 +504,8 @@ def train(config, args):
                     report = {"method": args.method, "microbatch": microbatch, "batch_size": batch_size, "seconds_per_step": float(np.mean(step_seconds[1:])), "estimated_training_hours": float(np.mean(step_seconds[1:])*steps_per_epoch*sum(stages)/3600), "peak_gpu_gb": torch.cuda.max_memory_allocated(device)/1e9 if device.type == "cuda" else None}
                     report["world_size"] = world_size
                     report["factorized_attention"] = bool(getattr(args, "factorized_attention", False))
+                    if objective is not None:
+                        report["ggf"] = objective
                     if rank == 0:
                         _atomic_json(run / "profile.json", report)
                     LOG.info("Profile: %s", report)
@@ -487,6 +522,8 @@ def train(config, args):
             start_step, permutation = 0, None
             validation_terms = validate(model, validation, config, stage, norm, device, rng, microbatch)
             row = {"epoch": epoch, "stage": stage, "train": (losses_sum/(steps_per_epoch - (resume.get('step_in_epoch', 0) if resume and epoch == start_epoch+1 else 0))).tolist(), "validation": validation_terms.tolist(), "seconds": time.monotonic()-epoch_started}
+            if objective is not None:
+                row["ggf"] = objective
             if rank == 0:
                 with open(run / "metrics.jsonl", "a") as stream:
                     stream.write(json.dumps(row)+"\n")
@@ -510,13 +547,21 @@ def validate(model, dataset, config, stage, norm, device, rng, microbatch):
     for batch_index, indices in enumerate(permutation.reshape(-1, batch_size)):
         x, features = dataset.batch(indices, device)
         x = random_rotations(x)*norm
-        lo, hi = [(0.6, 1.), (0.099, 0.6), (1e-5, 0.099)][stage] if model.method == "mixture" else (1e-5, 1.)
-        t = torch.rand((len(x), 1), device=device)*(hi-lo)+lo
+        full_noise = full_noise_std = None
+        if model.method == "ggf":
+            identity = ggf_identity(config)
+            t = x.new_zeros((len(x), 1))
+            full_noise_std = sample_noise_std(x, identity["sigma_min"], identity["sigma_max"])
+            full_noise = torch.randn_like(x)
+        else:
+            lo, hi = [(0.6, 1.), (0.099, 0.6), (1e-5, 0.099)][stage] if model.method == "mixture" else (1e-5, 1.)
+            t = torch.rand((len(x), 1), device=device)*(hi-lo)+lo
         for begin in range(0, len(x), microbatch):
             end = min(begin+microbatch, len(x))
             # Advance identical generators on every rank, including skipped
             # batches. This retains the original validation RNG sequence.
-            noise = torch.randn_like(x[begin:end])
+            noise = (full_noise[begin:end] if full_noise is not None
+                     else torch.randn_like(x[begin:end]))
             vectors = (config["training"]["sigma"] * torch.randn((2, end-begin, x.shape[1]), device=device)
                        if model.method == "fokker_planck" else None)
             if batch_index % world_size != rank:
@@ -524,7 +569,8 @@ def validate(model, dataset, config, stage, norm, device, rng, microbatch):
             # Conservative models require local coordinate autograd even in evaluation.
             with torch.no_grad():
                 terms = losses(model, x[begin:end], features[begin:end], t[begin:end], config, stage,
-                               noise=noise, vectors=vectors, training=False)
+                               noise=noise, vectors=vectors, training=False,
+                               noise_std=None if full_noise_std is None else full_noise_std[begin:end])
             if not torch.isfinite(terms).all():
                 raise FloatingPointError("Nonfinite validation loss")
             total += terms.detach().cpu().numpy()*((end-begin)/batch_size)
@@ -539,7 +585,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/dipeptides.yaml")
     parser.add_argument("--prepare-data", action="store_true")
-    parser.add_argument("--method", choices=["diffusion", "mixture", "fokker_planck"])
+    parser.add_argument("--method", choices=["diffusion", "mixture", "fokker_planck", "ggf"])
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--microbatch", type=int)
     parser.add_argument("--resume")

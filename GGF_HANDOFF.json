@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "created_at_utc": "2026-10-23T21:29:24.374942+00:00",
+  "repository": "/home/anirudh/ggf_md",
+  "status": "stopped_for_handoff",
+  "automatic_restart": false,
+  "explicit_resume_required": true,
+  "controller_running": false,
+  "training_running": false,
+  "old_worktree_retired": true,
+  "all_original_source_preserved": true,
+  "paths": {
+    "guide": "GGF_HANDOFF.md",
+    "experiment": "GGF_EXPERIMENT.md",
+    "config": "configs/dipeptides_ggf.yaml",
+    "checkpoint": "data/ggf/runs/ggf/seed1/latest.pt",
+    "run_directory": "data/ggf/runs/ggf/seed1",
+    "processed_dataset": "data/ggf/processed",
+    "manifest": "data/ggf/processed/manifest.json",
+    "pipeline_state": "data/ggf/experiment/status.json",
+    "stage_logs": "data/ggf/experiment/stages",
+    "controller_log": "data/ggf/controller.log",
+    "results": "data/ggf/results",
+    "validation": "data/ggf/validation",
+    "migration_evidence": "data/ggf/implementation/main-folder-migration",
+    "frozen_baseline_source": "data/ggf/implementation/baseline",
+    "completed_baseline_results": "data/ggf/baselines/non-fokker-planck",
+    "archived_old_worktree_source": "data/ggf/implementation/main-folder-migration/old-worktree-source",
+    "runtime_environment": "data/ggf/implementation/main-folder-migration/environment-at-handoff.json"
+  },
+  "storage": {
+    "logical_data_root": "data/ggf",
+    "physical_data_root": "/dm7100f/logs/anirudh-ggf-single-energy-20261023/data",
+    "processed_physical_root": "/home/anirudh/ggf_md/data/processed",
+    "large_files_duplicated": false,
+    "linked_targets_required_for_transfer": true,
+    "different_host_requires_path_and_provenance_rebind": true
+  },
+  "checkpoint": {
+    "path": "data/ggf/runs/ggf/seed1/latest.pt",
+    "sha256": "2c6e5be1554ac253bc38d224c6c4c4ac9c0b6bd2108e8f9fff9d081d054dd393",
+    "bytes": 99846489,
+    "completed_epochs": 2,
+    "current_epoch_one_based": 3,
+    "step_in_epoch": 2000,
+    "steps_per_epoch": 8374,
+    "global_optimizer_steps": 18748,
+    "configured_epochs": 120,
+    "configured_optimizer_steps": 1004880,
+    "completed": false,
+    "checkpoint_rewritten": false,
+    "native_resume_verified": true,
+    "preserved": [
+      "model",
+      "ema",
+      "optimizer",
+      "scheduler",
+      "data permutation",
+      "Python/NumPy/Torch/CUDA RNG"
+    ],
+    "note": "SIGTERM does not save a new checkpoint; unsaved updates replay from latest.pt."
+  },
+  "ggf": {
+    "objective": "ggf_singleton",
+    "noise_conditioned": false,
+    "sigma_min": 0.0010004971259352385,
+    "sigma_max": 20.0,
+    "bandwidth_h": 0.0010004971259352385,
+    "fixed_time": 0.0,
+    "iid_sampler": "ve_euler_maruyama",
+    "iid_score_adapter": "h2_over_sigma2"
+  },
+  "execution": {
+    "microbatch": 1024,
+    "compile": true,
+    "factorized_attention": true,
+    "inference_cache": true,
+    "cuda_graphs": true
+  },
+  "dataset": {
+    "norm_factor": 7.27558413079074,
+    "manifest_sha256": "1a8719baaf7f906b8c2830b05c6b4576b5b90d044dd2e7a1a585fb80435f4d12",
+    "processed_array_count": 684,
+    "peptides_by_split": {
+      "train": 175,
+      "val": 75,
+      "test": 92
+    }
+  },
+  "resume": {
+    "cwd": "/home/anirudh/ggf_md",
+    "environment": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "MPLCONFIGDIR": "/home/anirudh/ggf_md/data/ggf/matplotlib",
+      "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "argv": [
+      "/home/anirudh/.local/venvs/ggf_md/bin/python",
+      "-u",
+      "scripts/run_ggf_experiment.py",
+      "--config",
+      "configs/dipeptides_ggf.yaml",
+      "--gpus",
+      "3,2,1,0",
+      "--microbatch",
+      "1024",
+      "--compile",
+      "--factorized-attention",
+      "--inference-cache",
+      "--cuda-graphs"
+    ],
+    "retry_failed_required": false,
+    "command_executed": false,
+    "note": "Keep the total 120 epochs and the saved execution settings."
+  },
+  "evaluation": {
+    "iid": "not_started",
+    "simulation": "not_started",
+    "trained_model_metrics": "not_started",
+    "validation_outputs_are_experimental_results": false
+  },
+  "verification": {
+    "evaluator_cpu_checks": 55,
+    "runner_cpu_checks": 15,
+    "checkpoint_sha256_verified": true,
+    "native_checkpoint_resume_compatible": true,
+    "all_registered_processes_terminal": true,
+    "no_gpu_work_started": true
+  },
+  "source_sha256": {
+    "model.py": "7eb4eeef028ca16e8c21e898ceae9f9ffaa161dc486e314cca1bcc972d498f9b",
+    "train.py": "8d961320de49eab0b5e2b6e1232d1986f96a649762ab0ac16f056c53de1abf48",
+    "evaluate.py": "1e9f8029ffe0c78cefa26a958a2cdf58725b080ae350a908ec9b55ae10bbcda1",
+    "ggf_score_matching.py": "447a62e1c38a6c8cbbae9b5a803fb2c96828702d3feecb2b3f71c272f74b7597",
+    "configs/dipeptides_ggf.yaml": "7681d73fe2e2705d076baf459008fd2a2e0711b9dc6fbc410073178c7f65419e",
+    "scripts/run_ggf_experiment.py": "ecb3f16ca0420cd859fb43db4781060e41c0204e32dca9969d5e50dc8a155cb1",
+    "scripts/report_ggf_results.py": "92f5010c50b96470a0cb06bfe9b8fda8de7e5574ea71a55eab8586a1c569a9a4",
+    "scripts/validate_ggf_training.py": "b6cd5579ff4fa3e752556bd77bf76340c8c2d494c18dd7806fc8ff3f7c0b8093",
+    "scripts/validate_ggf_evaluation.py": "13beb57e9c77a480837e1a54b9635939997dc1fd71746f21ee493f7c24c6f9da",
+    "scripts/validate_ggf_runner.py": "439a2c3b8aa79db452f030a8210ca0f0a5a138cf22f8bca7a69eae55d9ac00fa",
+    "scripts/validate_ggf_cuda.py": "c7993ad77641a6d2a4cf5d4b6e6cf5b9c898e622d387f8642648a12fa69411c2",
+    "GGF_HANDOFF.md": "f99d0c30c1495561956dec8324f80b6327c9ff9837e72d086d95af03c840dd2c",
+    "GGF_EXPERIMENT.md": "d6f4f683121443de00c88eec1b92d2f9bb53f5a5a9513136b1fb73166f4b602f",
+    "README.md": "05f75215dc00f989126c37c577cab24f133b8c0b4a78ad6377e0af98daba276e",
+    "NON_FOKKER_PLANCK_RESULTS.md": "427c70c02fab888d8448433af63a29bb8c11ecd60f1b191b836c738163cf5422",
+    "environment.yml": "183bb47dc836a00c6515008a96c0388c286d93f453cb9b9049faa805c25acfbe"
+  },
+  "evidence_sha256": {
+    "stop-receipt.json": "ff36da8a96e12e03dee59afb4f60af4e35dc25eaaf953e4fa58b697936295712",
+    "checkpoint-review.json": "e8a82cb28d24bcf3e6bb525c91d9eb9d806f60049857ac9f3637720b037ab4c1",
+    "copy-receipt.json": "65d8c1b3ec8125a546f6874465489f8ade54f48cdbb1efa7f3b438d5e1da9dd1",
+    "old-worktree-source-receipt.json": "1c25bef80bbbe6f3cffd8f1af9f09bf1531e280913f47d5a7610512d1d8a61c4",
+    "state-rebind-receipt.json": "0c53adb6d6efdd1e2f9b5cf05eaaab137459fa57db9a823aef0205513d78cb35",
+    "worktree-retirement-receipt.json": "2d2a90ed9845e93cb8676b5fb77e63489e109ba438099263f0a0cb7abdce8db0",
+    "environment-at-handoff.json": "6155d4d43a41f929ec6bdf5fb4584ac4be4d91a460917c701bc6a0aa26232aaf",
+    "rebind-stopped-state.py": "0e39d5b1ed7a4a02c7f7769db015e5d3d6e78022d55464586d4a20fe07c2e265",
+    "validation/ggf-evaluation-main.json": "deec9f767e277c808698905558363f3522791d093895451b3f65e5ba8f7f7b45",
+    "validation/ggf-runner-main-checks-20261023T212635Z.json": "cea1bf77643cb2c72c19db29e96b2020001bcc20e1bcb418bd7c01b1637fb7f4",
+    "status-after-rebind.json": "6125655ac72d4a6ca84a1b73d7f69eebcd997298b4a878d372efa4ce3e8333cc",
+    "final-handoff-verification.json": "776b287ca079293861b9282c96cc3c118958ebd47b849e99fccdf1e0931d9bb0"
+  },
+  "pipeline_state_sha256": "2685c3ff65975a763f8addaa1c77622bce912c20028803c145ed71e57398267c",
+  "runtime_versions": {
+    "python": "3.11.8 | packaged by conda-forge | (main, Feb 16 2024, 20:53:32) [GCC 12.3.0]",
+    "torch": "2.8.0+cu126",
+    "numpy": "1.26.4"
+  }
+}

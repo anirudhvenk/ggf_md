@@ -94,10 +94,12 @@ class TransformerLayer(nn.Module):
 
 
 class GraphTransformer(nn.Module):
-    def __init__(self, width, layers, embedding_dim, heads, head_dim, time_range, potential):
+    def __init__(self, width, layers, embedding_dim, heads, head_dim, time_range, potential,
+                 fixed_time=None):
         super().__init__()
         self.t1, self.t0 = time_range
         self.potential = potential
+        self.fixed_time = fixed_time
         # Preserve the source's asymmetric test, including its missing abs().
         self.relative_time = self.t0 >= 1e-6 or self.t1 - 1.0 >= 1e-6
         self.scalar_embeddings = nn.ModuleList(nn.Embedding(size, embedding_dim) for size in (20, 5, 3, 2))
@@ -111,6 +113,10 @@ class GraphTransformer(nn.Module):
         self._factored_attention = False
 
     def time_features(self, t):
+        if self.fixed_time is not None:
+            # Keep the baseline architecture while making every expert path,
+            # including direct inference and functional gradients, time independent.
+            t = torch.full_like(t, self.fixed_time)
         t = t.clamp(self.t0, self.t1)
         features = [t - (self.t1 - self.t0) / 2, (2 * math.pi * t).cos(),
                     (2 * math.pi * t).sin(), -(4 * math.pi * t).cos()]
@@ -194,7 +200,7 @@ class DipeptideModel(nn.Module):
         super().__init__()
         self.method = method
         settings = config.get("model", {})
-        if method not in ("diffusion", "fokker_planck", "two_for_one", "mixture"):
+        if method not in ("diffusion", "fokker_planck", "two_for_one", "mixture", "ggf"):
             raise ValueError(f"Unknown method: {method}")
         self.ranges = [(1.0, 0.6), (0.6, 0.1), (0.1, 0.0)] if method == "mixture" else [(1.0, 0.0)]
         self.experts = nn.ModuleList()
@@ -204,7 +210,8 @@ class DipeptideModel(nn.Module):
             layers = settings.get("layers", 3) if potential else settings.get("score_layers", 2)
             self.experts.append(GraphTransformer(width, layers, settings.get("embedding_dim", 16),
                                                 settings.get("heads", 8), settings.get("head_dim", 64),
-                                                time_range, potential))
+                                                time_range, potential,
+                                                fixed_time=0.0 if method == "ggf" else None))
         self.apply(_initialize)
 
     def freeze_for_stage(self, stage):

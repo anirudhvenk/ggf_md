@@ -1,5 +1,9 @@
 # Transferable dipeptides in PyTorch
 
+GGF training is stopped for handoff. See [GGF_HANDOFF.md](GGF_HANDOFF.md) for
+the saved checkpoint, data, and resume instructions, and
+[GGF_EXPERIMENT.md](GGF_EXPERIMENT.md) for the model and evaluation protocol.
+
 Minimal reproduction of the dipeptide generalization experiment in
 [Consistent Sampling and Simulation](https://arxiv.org/pdf/2506.17139v3).
 Original implementation: [ScoreMD](https://github.com/noegroup/ScoreMD), revision

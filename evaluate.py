@@ -20,8 +20,10 @@ from scipy.stats import gaussian_kde
 
 from model import DipeptideModel
 from train import load_config, load_split
+from ggf_score_matching import ggf_identity
 
 METHODS = ("diffusion", "two_for_one", "mixture", "fokker_planck")
+SUPPORTED_METHODS = METHODS + ("ggf",)
 # Table of complete dipeptide metrics, arXiv:2506.17139v3, section C.8.1.
 PAPER = {
     "diffusion": ([.0155, .2256, .206, 6.515], [.0083, .1304, .159, 3.175]),
@@ -153,6 +155,8 @@ def make_score(model, compile_model=False):
         functions.append(torch.compile(call, fullgraph=True, dynamic=False) if compile_model else call)
 
     def score(x, features, t, scalar_time):
+        if model.method == "ggf":
+            return functions[0](x, features, t)
         active = [i for i, (hi, lo) in enumerate(model.ranges) if lo <= scalar_time <= hi]
         return sum(functions[i](x, features, t) for i in active) / len(active)
     return score
@@ -165,6 +169,12 @@ def load_model(config, method, device, checkpoint=None):
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if state.get("method", trained_method) != trained_method:
         raise ValueError(f"Expected {trained_method} checkpoint, got {state.get('method')} in {checkpoint}")
+    if trained_method == "ggf":
+        expected = ggf_identity(config)
+        if state.get("ggf") != expected or ggf_identity(state["config"]) != expected:
+            raise ValueError("GGF checkpoint objective/noise bounds differ from evaluation")
+        if state["config"]["model"] != config["model"]:
+            raise ValueError("GGF checkpoint architecture differs from evaluation")
     model = DipeptideModel(trained_method, state.get("config", config)).to(device)
     model.load_state_dict(state.get("ema", state["model"]))
     model.eval().requires_grad_(False)
@@ -247,6 +257,30 @@ def reverse_diffusion(score, features, n, steps, generator, norm_factor):
     return x / norm_factor
 
 
+def reverse_ve_diffusion(score, features, n, steps, generator, norm_factor, sigma_min, sigma_max):
+    """ScoreMD-style VE Euler-Maruyama with the agreed unconditional GGF adapter.
+
+    The raw energy field is converted by h²/sigma(t)² for IID sampling only.
+    Combined with g(t)², reverse drift is 2*log(sigma_max/h)*h²*field.
+    This experimental adapter does not make the network noise-conditioned.
+    """
+    if not (math.isfinite(sigma_min) and math.isfinite(sigma_max)
+            and 0 < sigma_min < sigma_max and steps >= 2):
+        raise ValueError("VE requires 0 < sigma_min < sigma_max and at least two steps")
+    device = features.device
+    log_ratio = math.log(sigma_max / sigma_min)
+    x = sigma_max * torch.randn(n, 30, device=device, generator=generator)
+    dt = x.new_tensor(1 / (steps - 1))
+    drift_scale = 2 * log_ratio * sigma_min**2
+    for scalar_time in np.linspace(0, 1, steps, dtype=np.float32)[::-1]:
+        t = torch.full((n, 1), float(scalar_time), device=device)
+        field = score(x, features, t, float(scalar_time))
+        diffusion = sigma_min * math.exp(float(scalar_time) * log_ratio) * math.sqrt(2 * log_ratio)
+        x = (x + drift_scale * field * dt + diffusion * torch.sqrt(dt)
+             * torch.randn(x.shape, device=device, generator=generator)).detach()
+    return x / norm_factor
+
+
 def generate_iid(config, split, model, norm, checkpoint_hash, directory, device, compiled=False):
     # Diffusion and Two-for-One deliberately share these samples. A lock allows
     # concurrent per-method jobs to wait for that dependency and then resume/skip.
@@ -261,6 +295,8 @@ def _generate_iid(config, split, model, norm, checkpoint_hash, directory, device
                 "steps": settings["diffusion_steps"], "seed": settings["seed"], "batch": settings["inference_batch"],
                 "compiled": compiled, "inference_cache": model.experts[0]._inference_cache,
                 **factorized_attention_identity(model)}
+    if model.method == "ggf":
+        identity["ggf"] = ggf_identity(config)
     metadata = directory / "iid_metadata.json"
     if metadata.exists() and json.loads(metadata.read_text()) != identity:
         raise ValueError(f"IID settings/checkpoint differ from {metadata}; use a fresh output directory")
@@ -284,7 +320,12 @@ def _generate_iid(config, split, model, norm, checkpoint_hash, directory, device
         while done < count:
             n = min(batch, count - done)
             features = feature.unsqueeze(0).expand(n, -1, -1)
-            x = reverse_diffusion(score, features, n, settings["diffusion_steps"], generator, norm)
+            if model.method == "ggf":
+                spec = identity["ggf"]
+                x = reverse_ve_diffusion(score, features, n, settings["diffusion_steps"], generator, norm,
+                                         spec["sigma_min"], spec["sigma_max"])
+            else:
+                x = reverse_diffusion(score, features, n, settings["diffusion_steps"], generator, norm)
             array[done:done + n] = x.cpu().numpy()
             done += n
             array.flush()
@@ -403,6 +444,8 @@ def simulate(config, split, model, norm, checkpoint_hash, directory, device, com
                 **{key: settings[key] for key in PROTOCOL_KEYS}, "method": model.method,
                 "compiled": compiled, "cuda_graphs": cuda_graphs, "inference_cache": model.experts[0]._inference_cache,
                 **factorized_attention_identity(model)}
+    if model.method == "ggf":
+        identity["ggf"] = ggf_identity(config)
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory / "simulation_metadata.json"
     if not profile_steps and metadata.exists() and json.loads(metadata.read_text()) != identity:
@@ -489,20 +532,31 @@ def plot_results(truth, iid, simulation, sequence, directory, settings):
     kbt = settings["temperature"] * R_GAS
     datasets = {"Reference": truth, "Independent": iid, "Simulation": simulation}
     fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    image = None
     for ax, (label, sample) in zip(axes, datasets.items()):
+        if not len(sample):
+            ax.text(.5, .5, "No finite samples", transform=ax.transAxes, ha="center", va="center")
+            ax.set(xlabel=r"$\varphi$", ylabel=r"$\psi$", title=f"{sequence}: {label}",
+                   xlim=(-np.pi, np.pi), ylim=(-np.pi, np.pi))
+            continue
         counts = np.histogram2d(*sample.T, bins=settings["plot_bins"], range=[[-np.pi, np.pi]] * 2)[0]
         pmf = -np.log(counts / max(1, counts.sum()) + 1e-6)
         pmf -= pmf.min()
         image = ax.imshow(pmf.T, extent=(-np.pi, np.pi, -np.pi, np.pi), origin="lower", vmin=0, vmax=12,
                           aspect="equal", cmap="magma_r")
         ax.set(xlabel=r"$\varphi$", ylabel=r"$\psi$", title=f"{sequence}: {label}")
-    fig.colorbar(image, ax=list(axes), label=r"PMF / $k_BT$")
+    if image is not None:
+        fig.colorbar(image, ax=list(axes), label=r"PMF / $k_BT$")
     fig.savefig(directory / f"{sequence}_pmf_2d.png", dpi=150)
     plt.close(fig)
     grid = np.linspace(-np.pi, np.pi, 100)
     fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
     for dim, ax in enumerate(axes):
         for label, sample in datasets.items():
+            if not len(sample):
+                ax.text(.98, .98, f"{label}: no finite samples", transform=ax.transAxes,
+                        ha="right", va="top", fontsize=8)
+                continue
             # Preserve source plot_fes_angles: concatenate periodic images, then
             # plot_fes filters to [-pi, pi] before fitting the KDE.
             extended = np.concatenate([sample[:, dim], sample[:, dim] + 2 * np.pi, sample[:, dim] - 2 * np.pi])
@@ -528,12 +582,22 @@ def evaluate_outputs(config, split, method, directory, iid_directory):
         raise ValueError(f"Configured simulation protocol differs from saved state: {state_path}")
     if state["identity"]["method"] != method:
         raise ValueError(f"Saved simulation method differs from {method}: {state_path}")
+    if method == "ggf":
+        expected_ggf = ggf_identity(config)
+        if state["identity"].get("ggf") != expected_ggf:
+            raise ValueError("Saved GGF simulation objective/noise bounds differ")
+        if json.loads((directory / "simulation_metadata.json").read_text()) != state["identity"]:
+            raise ValueError("GGF simulation metadata differs from its committed state")
     if state["completed"] != settings["simulation_steps"]:
         raise ValueError(f"Incomplete simulation at {state['completed']} steps in {directory}")
     rows = []
     for i, sequence in enumerate(settings["peptides"]):
         iid_state = torch.load(iid_directory / f"{sequence}_iid_state.pt", weights_only=False)
         expected_iid = {"samples": settings["num_iid_samples"], "steps": settings["diffusion_steps"], "seed": settings["seed"]}
+        if method == "ggf":
+            expected_iid["ggf"] = expected_ggf
+            if json.loads((iid_directory / "iid_metadata.json").read_text()) != iid_state["identity"]:
+                raise ValueError("GGF IID metadata differs from its committed state")
         if any(iid_state["identity"].get(key) != value for key, value in expected_iid.items()):
             raise ValueError(f"Configured IID protocol differs from saved {sequence} samples")
         if iid_state["identity"]["checkpoint"] != state["identity"]["checkpoint"]:
@@ -554,6 +618,11 @@ def evaluate_outputs(config, split, method, directory, iid_directory):
                "iid_valid_samples": int(np.isfinite(iid).all(axis=1).sum()),
                "simulation_valid_samples": int(np.isfinite(simulation).all(axis=1).sum()),
                "simulation_alive_paths": int(alive.sum()), "simulation_total_paths": settings["replicas"]}
+        if method == "ggf":
+            row.update(simulation_dead_paths=int((~alive).sum()),
+                       iid_missing_reason="no_finite_iid_samples" if not row["iid_valid_samples"] else None,
+                       simulation_missing_reason=("no_surviving_paths" if not alive.any() else
+                                                  "no_finite_simulation_samples" if not row["simulation_valid_samples"] else None))
         for source, sample in (("iid", iid), ("simulation", simulation)):
             row.update({f"{source}_{key}": value for key, value in metrics(truth, sample, settings["bins"]).items()})
         rows.append(row)
@@ -566,36 +635,53 @@ def evaluate_outputs(config, split, method, directory, iid_directory):
     with process_lock(directory.parent / ".summary.lock"):
         frame.to_csv(directory / "metrics.csv", index=False)
         write_json(rows, directory / "metrics.json")
-        write_json(metrics_identity(settings), directory / "metrics_metadata.json")
+        write_json(metrics_identity(settings, ggf=ggf_identity(config) if method == "ggf" else None),
+                   directory / "metrics_metadata.json")
     return frame
 
 
-def metrics_identity(settings):
-    return {key: settings[key] for key in PROTOCOL_KEYS + ("num_iid_samples", "diffusion_steps", "bins")}
+def metrics_identity(settings, *, ggf=None):
+    identity = {key: settings[key] for key in PROTOCOL_KEYS + ("num_iid_samples", "diffusion_steps", "bins")}
+    if ggf is not None:
+        identity["ggf"] = ggf
+    return identity
 
 
-def write_summary(result_root, frames, settings):
+def write_summary(result_root, frames, settings, *, ggf=None):
     combined = pd.concat(frames, ignore_index=True)
     combined.to_csv(result_root / "per_peptide.csv", index=False)
     summary, comparison = {}, []
-    metric_names = [c for c in combined.columns if c.startswith(("iid_", "simulation_"))
-                    and not c.endswith(("samples", "paths"))]
+    numerical = {f"{source}_{metric}" for source in ("iid", "simulation")
+                 for metric in ("jsd", "js_distance", "pmf", "code_jsd", "code_pmf", "code_mjs")}
+    metric_names = [c for c in combined.columns if c in numerical]
     for method, group in combined.groupby("method", sort=False):
         summary[method] = {}
         for name in metric_names:
             values = group[name].dropna()
-            mean, std = (float(values.mean()), float(values.std(ddof=0))) if len(values) else (None, None)
+            complete = bool(len(values))
+            if method == "ggf":
+                values = values[np.isfinite(values)]
+                source = "iid" if name.startswith("iid_") else "simulation"
+                complete = (len(group) == len(settings["peptides"]) and not group.peptide.duplicated().any()
+                            and set(group.peptide) == set(settings["peptides"])
+                            and len(values) == len(settings["peptides"])
+                            and (group[f"{source}_valid_samples"] == settings["num_iid_samples"]).all())
+            mean, std = (float(values.mean()), float(values.std(ddof=0))) if complete else (None, None)
             summary[method][name] = {"mean": mean, "std_across_peptides": std,
                                    "evaluated_peptides": len(values), "expected_peptides": len(settings["peptides"])}
+            if method == "ggf":
+                summary[method][name]["status"] = "complete" if complete else "incomplete_coverage"
         for index, name in enumerate(PAPER_METRICS):
             result = summary[method][name]
             for definition in ("paper", "released_code"):
                 current = name if definition == "paper" else name.replace("_jsd", "_code_jsd").replace("_pmf", "_code_pmf")
                 measured = summary[method][current]
+                paper_mean = PAPER[method][0][index] if method in PAPER else None
+                paper_std = PAPER[method][1][index] if method in PAPER else None
                 comparison.append({"method": method, "metric_definition": definition, "metric": name,
                                    "mean": measured["mean"], "std": measured["std_across_peptides"],
-                                   "paper_mean": PAPER[method][0][index], "paper_std": PAPER[method][1][index],
-                                   "gap": None if measured["mean"] is None else measured["mean"] - PAPER[method][0][index],
+                                   "paper_mean": paper_mean, "paper_std": paper_std,
+                                   "gap": None if measured["mean"] is None or paper_mean is None else measured["mean"] - paper_mean,
                                    "evaluated_peptides": measured["evaluated_peptides"]})
     report = {"source": "https://arxiv.org/pdf/2506.17139v3", "methods": summary,
               "settings": settings, "comparison": comparison,
@@ -604,6 +690,12 @@ def write_summary(result_root, frames, settings):
                         "Standard deviations are across peptides, not independent training seeds.",
                         "Nonfinite simulation paths are excluded as in released code; counts are reported explicitly.",
                         "Two-for-One shares diffusion weights and independent samples."]}
+    if ggf is not None:
+        report["ggf"] = ggf
+        report["notes"].extend([
+            "GGF uses a noise-unconditional energy field and a singleton target; IID uses the experimental h²/sigma(t)² VE adapter.",
+            "GGF has no published reference row; its paper means, standard deviations and gaps are null.",
+            "GGF aggregates require every configured peptide and the full valid sample count; missing coverage has null means/stds."])
     write_json(report, result_root / "summary.json")
     pd.DataFrame(comparison).to_csv(result_root / "comparison.csv", index=False)
     print(pd.DataFrame(comparison).to_string(index=False), flush=True)
@@ -612,7 +704,7 @@ def write_summary(result_root, frames, settings):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/dipeptides.yaml")
-    parser.add_argument("--method", choices=("all",) + METHODS, default="all")
+    parser.add_argument("--method", choices=("all",) + SUPPORTED_METHODS, default="all")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint")
     parser.add_argument("--compile", action="store_true", help="Compile static expert score functions; validates against eager")
@@ -636,8 +728,13 @@ def main():
     config = load_config(args.config)
     settings = config["evaluation"]
     configured_methods = tuple(settings.get("methods", METHODS))
-    if not configured_methods or len(set(configured_methods)) != len(configured_methods) or set(configured_methods) - set(METHODS):
+    if not configured_methods or len(set(configured_methods)) != len(configured_methods) or set(configured_methods) - set(SUPPORTED_METHODS):
         parser.error("evaluation.methods must contain unique supported method names")
+    if args.method == "ggf" or args.method == "all" and "ggf" in configured_methods:
+        try:
+            ggf_identity(config)
+        except (KeyError, TypeError, ValueError) as error:
+            parser.error(f"Invalid or missing GGF settings: {error}")
     overrides = {"num_iid_samples": args.iid_samples, "simulation_steps": args.simulation_steps, "replicas": args.replicas}
     smoke = any(value is not None and value != settings[key] for key, value in overrides.items())
     settings.update({key: value for key, value in overrides.items() if value is not None})
@@ -700,13 +797,15 @@ def main():
                 existing = result_root / method / "metrics.csv"
                 if method not in by_method and existing.exists():
                     metadata = existing.with_name("metrics_metadata.json")
-                    if not metadata.exists() or json.loads(metadata.read_text()) != metrics_identity(settings):
+                    expected = metrics_identity(settings, ggf=ggf_identity(config) if method == "ggf" else None)
+                    if not metadata.exists() or json.loads(metadata.read_text()) != expected:
                         raise ValueError(f"Incompatible saved metrics: {existing}. Recompute with --method all --metrics-only")
                     frame = pd.read_csv(existing)
                     if set(frame.peptide) != set(settings["peptides"]) or frame.peptide.duplicated().any():
                         raise ValueError(f"Saved metrics have an incompatible peptide list: {existing}")
                     by_method[method] = frame
-            write_summary(result_root, list(by_method.values()), settings)
+            write_summary(result_root, list(by_method.values()), settings,
+                          ggf=ggf_identity(config) if "ggf" in configured_methods else None)
 
 
 if __name__ == "__main__":

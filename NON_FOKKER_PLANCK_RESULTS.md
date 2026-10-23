@@ -63,10 +63,10 @@ Metric definitions substantially affect PMF magnitudes. The main tables use one 
 
 ## Source artifacts
 
-- [Full summary](/dm7100f/logs/anirudh-ggf_md-20261022/reports/non-fokker-planck/all-completed-20261023T1748Z/summary.json)
-- [Per-peptide metrics](/dm7100f/logs/anirudh-ggf_md-20261022/reports/non-fokker-planck/all-completed-20261023T1748Z/per_peptide.csv)
-- [Both definitions and paper comparisons](/dm7100f/logs/anirudh-ggf_md-20261022/reports/non-fokker-planck/all-completed-20261023T1748Z/comparison.csv)
-- [Report provenance and hashes](/dm7100f/logs/anirudh-ggf_md-20261022/reports/non-fokker-planck/all-completed-20261023T1748Z/report_receipt.json)
-- [Independent report review](/dm7100f/logs/anirudh-ggf_md-20261022/.storage-validation/all-non-fokker-planck-report-review.json)
+- [Full summary](data/ggf/baselines/non-fokker-planck/summary.json)
+- [Per-peptide metrics](data/ggf/baselines/non-fokker-planck/per_peptide.csv)
+- [Both definitions and paper comparisons](data/ggf/baselines/non-fokker-planck/comparison.csv)
+- [Report provenance and hashes](data/ggf/baselines/non-fokker-planck/report_receipt.json)
+- [Independent report review](data/ggf/baselines/all-non-fokker-planck-report-review.json)
 
 Report receipt SHA-256: `577fc4b1b5e389f36be149c74684efb4c4a646c4917b4a74d5aaa00214fab1bc`.
